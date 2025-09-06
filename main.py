@@ -10,6 +10,7 @@ def depth_completion(
     n_guide: np.ndarray | None,  # (H,W,3) 단위 노멀 (선택)
     guide_gray: np.ndarray | None,  # 엣지 가이드 (선택)
     K: np.ndarray | None,  # 카메라 내파라미터
+    lambda_normal_edge: float = 0.0,  # 노멀 기반 엣지 가중치 강도
     lambda_screen_init: float = 1.0,  # 초기화 시 known에 대한 스크린 강도
 ) -> tuple[np.ndarray, dict]:
     """
@@ -22,6 +23,7 @@ def depth_completion(
         n_guide: 가이드 노멀 벡터 (H,W,3) - 선택사항
         guide_gray: 엣지 가이드 그레이스케일 이미지 - 선택사항
         K: 카메라 내부 파라미터 - 선택사항
+        lambda_normal_edge: 노멀 유사도 기반 엣지 가중치 강도
         lambda_screen_init: 초기화 시 known 영역에 대한 스크린 강도
 
     Returns:
@@ -47,9 +49,11 @@ def depth_completion(
         known_mask=known_mask,
         hole_mask=hole_mask,
         guide_gray=guide_gray,
+        n_guide=n_guide,
         lambda_grad=3.0,
         lambda_smooth=0.3,
         edge_alpha=6.0,
+        lambda_normal_edge=lambda_normal_edge,
         tol=1e-4,
         maxiter=300,
         clip_min=0.0,

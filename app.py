@@ -116,6 +116,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
         lambda_grad = st.slider("Gradient 가중치", 0.1, 10.0, 3.0, 0.1)
         lambda_smooth = st.slider("Smooth 가중치", 0.1, 2.0, 0.3, 0.1)
         lambda_screen = st.slider("Screen 가중치", 0.0, 5.0, 1.0, 0.1)
+        lambda_normal_edge = st.slider("Normal edge 가중치", 0.0, 5.0, 0.0, 0.1)
 
     with col2:
         st.subheader("추가 설정")
@@ -151,6 +152,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
             n_guide=st.session_state.n_guide,
             guide_gray=st.session_state.guide_gray,
             K=st.session_state.K,
+            lambda_normal_edge=lambda_normal_edge,
             lambda_screen_init=lambda_screen,
         )
 

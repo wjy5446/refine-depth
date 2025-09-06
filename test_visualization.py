@@ -356,6 +356,7 @@ def run_example():
         n_guide=n_guide,
         guide_gray=guide_gray,
         K=K,
+        lambda_normal_edge=0.0,
         lambda_screen_init=1.0
     )
 

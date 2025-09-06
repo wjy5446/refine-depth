@@ -130,7 +130,7 @@ class InteractiveDepthCompletion:
             n_guide=self.n_guide,
             guide_gray=self.guide_gray,
             K=self.K,
-            cfg_gn=self.cfg_gn,
+            lambda_normal_edge=self.cfg_gn.lambda_normal,
             lambda_screen_init=1.0
         )
 
