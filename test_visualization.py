@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from utils import make_intrinsics, compute_normals_from_depth
 from main import depth_completion
-from refinement import GNConfig
 
 
 def create_synthetic_scene_with_holes(H=180, W=240, seed=0,
@@ -225,17 +224,16 @@ def visualize_depth_completion(depth_gt, depth_in, depth_out, hole_mask,
     return fig
 
 
-def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
-                                      depth_refine, hole_mask,
-                                      title="Depth Completion: 3-Stage Pipeline"):
+def visualize_depth_completion_1stage(depth_gt, depth_in, depth_initialize,
+                                      hole_mask,
+                                      title="Depth Completion: 1-Stage Pipeline"):
     """
-    3단계 깊이 완성 결과 시각화 (inpaint → initialize → refine)
+    1단계 깊이 완성 결과 시각화 (initialize)
 
     Args:
         depth_gt: Ground truth 깊이 맵
         depth_in: 입력 깊이 맵 (holes 포함)
         depth_initialize: initialize 결과
-        depth_refine: refine 결과
         hole_mask: 홀 영역 마스크
         title: 그래프 제목
 
@@ -244,12 +242,11 @@ def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
     """
     fig = plt.figure(figsize=(20, 15))
 
-    # 3D 뷰 (GT, Input, Initialize, Refine)
+    # 3D 뷰 (GT, Input, Initialize)
     stages = [
         (depth_gt, "GT"),
         (depth_in, "Input"),
-        (depth_initialize, "Initialize"),
-        (depth_refine, "Refine")
+        (depth_initialize, "Initialize")
     ]
 
     for i, (depth, name) in enumerate(stages):
@@ -265,7 +262,7 @@ def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
         ax.set_ylabel('Y')
         ax.set_zlabel('Depth')
 
-    # 2D 뷰 (GT, Input, Inpaint, Initialize, Refine)
+    # 2D 뷰 (GT, Input, Initialize)
     for i, (depth, name) in enumerate(stages):
         ax = fig.add_subplot(4, 4, i + 5)
         im = ax.imshow(depth, cmap='viridis', vmin=0, vmax=3)
@@ -273,11 +270,10 @@ def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
         ax.axis('off')
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # Error maps (Input, Inpaint, Initialize, Refine vs GT)
+    # Error maps (Input, Initialize vs GT)
     error_maps = [
         (np.abs(depth_gt - depth_in), "Input vs GT"),
-        (np.abs(depth_gt - depth_initialize), "Initialize vs GT"),
-        (np.abs(depth_gt - depth_refine), "Refine vs GT")
+        (np.abs(depth_gt - depth_initialize), "Initialize vs GT")
     ]
 
     for i, (error, name) in enumerate(error_maps):
@@ -301,18 +297,15 @@ def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
     gt_hole = depth_gt[hole_mask]
     in_hole = depth_in[hole_mask]
     init_hole = depth_initialize[hole_mask]
-    refine_hole = depth_refine[hole_mask]
 
     mae_values = [
         float(np.mean(np.abs(gt_hole - in_hole))),
-        float(np.mean(np.abs(gt_hole - init_hole))),
-        float(np.mean(np.abs(gt_hole - refine_hole)))
+        float(np.mean(np.abs(gt_hole - init_hole)))
     ]
 
     rmse_values = [
         float(np.sqrt(np.mean((gt_hole - in_hole)**2))),
-        float(np.sqrt(np.mean((gt_hole - init_hole)**2))),
-        float(np.sqrt(np.mean((gt_hole - refine_hole)**2)))
+        float(np.sqrt(np.mean((gt_hole - init_hole)**2)))
     ]
 
     stats = (
@@ -320,14 +313,12 @@ def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
         f"MAE:\n"
         f"  Input     : {mae_values[0]:.4f}\n"
         f"  Initialize: {mae_values[1]:.4f}\n"
-        f"  Refine    : {mae_values[2]:.4f}\n"
         f"\nRMSE:\n"
         f"  Input     : {rmse_values[0]:.4f}\n"
         f"  Initialize: {rmse_values[1]:.4f}\n"
-        f"  Refine    : {rmse_values[2]:.4f}\n"
         f"\nImprovement:\n"
-        f"  MAE gain  : {mae_values[0] - mae_values[2]:+.4f}\n"
-        f"  RMSE gain : {rmse_values[0] - rmse_values[2]:+.4f}"
+        f"  MAE gain  : {mae_values[0] - mae_values[1]:+.4f}\n"
+        f"  RMSE gain : {rmse_values[0] - rmse_values[1]:+.4f}"
     )
     ax17.text(0.05, 0.95, stats, transform=ax17.transAxes,
               fontsize=10, va='top', family='monospace',
@@ -335,7 +326,7 @@ def visualize_depth_completion_3stage(depth_gt, depth_in, depth_initialize,
 
     # 단계별 개선도
     ax18 = fig.add_subplot(4, 4, 15)
-    stages_names = ['Input', 'Initialize', 'Refine']
+    stages_names = ['Input', 'Initialize']
     ax18.plot(stages_names, mae_values, 'o-', label='MAE', linewidth=2, markersize=8)
     ax18.plot(stages_names, rmse_values, 's-', label='RMSE', linewidth=2, markersize=8)
     ax18.set_title('Error Progression')
@@ -356,41 +347,25 @@ def run_example():
      refine_roi, valid_mask, hole_mask) = create_synthetic_scene_with_holes(
         H, W, seed=0, noise_sigma=0.25, hole_mode="mixed")
 
-    # GN 정제까지 포함하고 싶으면 cfg_gn 전달
-    cfg_gn = GNConfig(
-        lambda_normal=2.0,
-        lambda_smooth=0.3,
-        lambda_screen=0.1,
-        loss="charbonnier",
-        eps_charb=1e-3,
-        gn_iters=2,
-        normal_stride=1,     # 느리면 2~3
-        edge_alpha=6.0,
-        step_clip_frac=0.5
-    )
-
-    # 3단계 파이프라인 실행 (Fast Marching Method 사용)
-    print("Running 3-stage pipeline with Fast Marching Method...")
-    depth_initialize, depth_refine = depth_completion(
+    # 1단계 파이프라인 실행
+    print("Running 1-stage pipeline...")
+    depth_initialize, timing_info = depth_completion(
         depth_in=depth_in,
         refine_roi=refine_roi,
         valid_mask=valid_mask,
         n_guide=n_guide,
         guide_gray=guide_gray,
         K=K,
-        cfg_gn=cfg_gn,
-        lambda_screen_init=1.0,
-        inpaint_method='fast_marching'
+        lambda_screen_init=1.0
     )
 
-    print("Done. Visualizing 3-stage pipeline...")
-    fig = visualize_depth_completion_3stage(
+    print("Done. Visualizing 1-stage pipeline...")
+    fig = visualize_depth_completion_1stage(
         depth_gt=depth_gt,
         depth_in=depth_in,
         depth_initialize=depth_initialize,
-        depth_refine=depth_refine,
         hole_mask=hole_mask,
-        title="Depth Completion: 3-Stage Pipeline (Fast Marching → Initialize → Refine)"
+        title="Depth Completion: 1-Stage Pipeline (Initialize)"
     )
     plt.show()
     return fig

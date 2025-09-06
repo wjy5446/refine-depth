@@ -1,6 +1,6 @@
 import numpy as np
+import time
 from initialization import initial_guess_logpoisson_completion
-from refinement import refine_depth_match_normals_gn_completion, GNConfig
 
 
 def depth_completion(
@@ -10,11 +10,10 @@ def depth_completion(
     n_guide: np.ndarray | None,  # (H,W,3) 단위 노멀 (선택)
     guide_gray: np.ndarray | None,  # 엣지 가이드 (선택)
     K: np.ndarray | None,  # 카메라 내파라미터
-    cfg_gn: GNConfig | None = None,  # GN 설정(선택)
     lambda_screen_init: float = 1.0,  # 초기화 시 known에 대한 스크린 강도
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, dict]:
     """
-    깊이 완성 메인 파이프라인: inpaint → initialize → refine
+    깊이 완성 메인 파이프라인: initialize
 
     Args:
         depth_in: 입력 깊이 맵 (NaN/0 포함 가능)
@@ -23,21 +22,28 @@ def depth_completion(
         n_guide: 가이드 노멀 벡터 (H,W,3) - 선택사항
         guide_gray: 엣지 가이드 그레이스케일 이미지 - 선택사항
         K: 카메라 내부 파라미터 - 선택사항
-        cfg_gn: 가우스-뉴턴 정제 설정 - 선택사항
         lambda_screen_init: 초기화 시 known 영역에 대한 스크린 강도
-        inpaint_method: inpaint 방법 ('telea' 또는 'ns')
 
     Returns:
-        (inpaint_result, initialize_result, refine_result) 튜플
+        (initialize_result, timing_info) 튜플
+        timing_info: 각 단계별 처리 시간 정보 딕셔너리
     """
+    # 시간 측정을 위한 딕셔너리 초기화
+    timing_info = {
+        'init_time': 0.0,
+        'total_time': 0.0
+    }
+
+    total_start_time = time.time()
     depth_in = depth_in.astype(np.float32)
     refine_roi = refine_roi.astype(bool)
     known_mask = (valid_mask.astype(bool) & np.isfinite(depth_in))
     hole_mask = refine_roi & (~known_mask)
 
-    # 2단계: Log-Poisson completion으로 초기화
+    # Log-Poisson completion으로 초기화
+    init_start_time = time.time()
     depth_initialize = initial_guess_logpoisson_completion(
-        depth_in=depth_in,  # inpaint 결과를 입력으로 사용
+        depth_in=depth_in,
         known_mask=known_mask,
         hole_mask=hole_mask,
         guide_gray=guide_gray,
@@ -49,14 +55,10 @@ def depth_completion(
         clip_min=0.0,
         clip_max=None
     )
+    init_end_time = time.time()
+    timing_info['init_time'] = init_end_time - init_start_time
 
-    n_g = n_guide / (np.linalg.norm(n_guide, axis=2, keepdims=True) + 1e-12)
+    total_end_time = time.time()
+    timing_info['total_time'] = total_end_time - total_start_time
 
-    # 3단계: GN 정제 (가이드 노멀 있는 경우 강력 추천)
-    if cfg_gn is not None and n_guide is not None:
-        depth_refine = refine_depth_match_normals_gn_completion(
-            depth_initialize, known_mask, hole_mask, n_g, K, guide_gray, cfg_gn)
-    else:
-        depth_refine = depth_initialize
-
-    return depth_initialize, depth_refine
+    return depth_initialize, timing_info

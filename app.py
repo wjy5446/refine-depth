@@ -2,12 +2,12 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 import io
+import time
 from PIL import Image
 
 from main import depth_completion
-from refinement import GNConfig
 from utils import make_intrinsics, compute_normals_from_depth
-from test_visualization import create_synthetic_scene_with_holes, visualize_depth_completion_3stage
+from test_visualization import create_synthetic_scene_with_holes
 
 # 페이지 설정
 st.set_page_config(
@@ -19,7 +19,7 @@ st.set_page_config(
 
 # 제목
 st.title("🔍 Depth Completion Pipeline")
-st.markdown("**Inpaint → Initialize → Refine** 3단계 깊이 완성 파이프라인")
+st.markdown("**Initialize** 1단계 깊이 완성 파이프라인")
 
 # 사이드바 설정
 st.sidebar.header("⚙️ 설정")
@@ -118,45 +118,86 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
         lambda_screen = st.slider("Screen 가중치", 0.0, 5.0, 1.0, 0.1)
 
     with col2:
-        st.subheader("Refine 설정")
-        lambda_data = st.slider("Data 가중치", 0.0, 2.0, 0.5, 0.1)
-        lambda_normal = st.slider("Normal 가중치", 0.0, 10.0, 5.0, 0.5)
-        lambda_smooth_refine = st.slider("Refine Smooth 가중치", 0.0, 2.0, 0.2, 0.1)
-        gn_iters = st.slider("GN 반복 수", 1, 10, 2)
+        st.subheader("추가 설정")
+        st.info("Log-Poisson completion을 사용합니다.")
 
     # 실행 버튼
     if st.button("🚀 파이프라인 실행", type="primary"):
-        with st.spinner("깊이 완성 파이프라인 실행 중..."):
+        # 시간 측정을 위한 컨테이너들
+        progress_container = st.container()
+        timing_container = st.container()
 
-            # Config 객체 생성
-            cfg_gn = GNConfig(
-                lambda_normal=2.0,
-                lambda_smooth=0.3,
-                lambda_screen=0.1,
-                loss="charbonnier",
-                eps_charb=1e-3,
-                gn_iters=2,
-                normal_stride=1,     # 느리면 2~3
-                edge_alpha=6.0,
-                step_clip_frac=0.5
-            )
+        with progress_container:
+            st.subheader("⏱️ 처리 진행 상황")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-            # 깊이 완성 실행
-            depth_initialize, depth_refine = depth_completion(
-                depth_in=st.session_state.depth_in,
-                refine_roi=st.session_state.refine_roi,
-                valid_mask=st.session_state.valid_mask,
-                n_guide=st.session_state.n_guide,
-                guide_gray=st.session_state.guide_gray,
-                K=st.session_state.K,
-                cfg_gn=cfg_gn,
-                lambda_screen_init=lambda_screen,
-            )
+        with timing_container:
+            st.subheader("📊 단계별 처리 시간")
+            timing_cols = st.columns(3)
 
-            # 세션 상태에 결과 저장
-            st.session_state.depth_initialize = depth_initialize
-            st.session_state.depth_refine = depth_refine
-            st.session_state.results_ready = True
+        # 전체 시작 시간
+        total_start_time = time.time()
+
+        # Initialize 실행
+        status_text.text("Initialize 실행 중...")
+        progress_bar.progress(50)
+
+        # 깊이 완성 실행
+        depth_initialize, timing_info = depth_completion(
+            depth_in=st.session_state.depth_in,
+            refine_roi=st.session_state.refine_roi,
+            valid_mask=st.session_state.valid_mask,
+            n_guide=st.session_state.n_guide,
+            guide_gray=st.session_state.guide_gray,
+            K=st.session_state.K,
+            lambda_screen_init=lambda_screen,
+        )
+
+        # 전체 완료
+        total_end_time = time.time()
+        total_time = total_end_time - total_start_time
+
+        progress_bar.progress(100)
+        status_text.text("✅ 모든 단계 완료!")
+
+        # 시간 표시
+        with timing_cols[0]:
+            init_ratio = timing_info['init_time']/total_time*100
+            st.metric("Initialize", f"{timing_info['init_time']:.3f}s", f"{init_ratio:.1f}%")
+        with timing_cols[1]:
+            st.metric("총 시간", f"{total_time:.3f}s", "완료")
+        with timing_cols[2]:
+            st.metric("", "", "")
+
+        # 전체 시간 표시
+        st.metric("총 처리 시간", f"{total_time:.3f}s", "완료")
+
+        # 시간 분포 차트
+        fig, ax = plt.subplots(figsize=(10, 6))
+        stages = ['Initialize']
+        times = [timing_info['init_time']]
+        colors = ['lightgreen']
+
+        bars = ax.bar(stages, times, color=colors, alpha=0.7)
+        ax.set_title('단계별 처리 시간 분포', fontsize=14, fontweight='bold')
+        ax.set_ylabel('처리 시간 (초)', fontsize=12)
+        ax.set_xlabel('처리 단계', fontsize=12)
+
+        # 각 막대 위에 시간 표시
+        for bar, time_val in zip(bars, times):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                    f'{time_val:.3f}s', ha='center', va='bottom', fontweight='bold')
+
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig)
+
+        # 세션 상태에 결과 저장
+        st.session_state.depth_initialize = depth_initialize
+        st.session_state.results_ready = True
+        st.session_state.timing_info = timing_info
 
         st.success("파이프라인 실행이 완료되었습니다!")
 
@@ -165,20 +206,34 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
         st.header("📊 결과 시각화")
 
         # 탭으로 구분
-        tab1, tab2, tab3 = st.tabs(["3단계 파이프라인", "단계별 비교", "성능 메트릭"])
+        tab1, tab2, tab3, tab4 = st.tabs(["1단계 파이프라인", "단계별 비교", "성능 메트릭", "처리 시간 분석"])
 
         with tab1:
-            st.subheader("Inpaint → Initialize → Refine 파이프라인")
+            st.subheader("Initialize 파이프라인")
 
-            # 3단계 파이프라인 시각화
-            fig = visualize_depth_completion_3stage(
-                depth_gt=st.session_state.depth_gt,
-                depth_in=st.session_state.depth_in,
-                depth_initialize=st.session_state.depth_initialize,
-                depth_refine=st.session_state.depth_refine,
-                hole_mask=st.session_state.hole_mask,
-                title="Depth Completion: 3-Stage Pipeline"
-            )
+            # 1단계 파이프라인 시각화
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+            # Ground Truth
+            im1 = axes[0].imshow(st.session_state.depth_gt, cmap='viridis', vmin=0, vmax=3)
+            axes[0].set_title('Ground Truth')
+            axes[0].axis('off')
+            plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+            # Input
+            im2 = axes[1].imshow(st.session_state.depth_in, cmap='viridis', vmin=0, vmax=3)
+            axes[1].set_title('Input (with holes)')
+            axes[1].axis('off')
+            plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+            # Initialize Result
+            im3 = axes[2].imshow(st.session_state.depth_initialize, cmap='viridis', vmin=0, vmax=3)
+            axes[2].set_title('Initialize Result')
+            axes[2].axis('off')
+            plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+
+            plt.suptitle('Depth Completion: 1-Stage Pipeline', fontsize=16, fontweight='bold')
+            plt.tight_layout()
             st.pyplot(fig)
 
         with tab2:
@@ -190,8 +245,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
             stages = [
                 (st.session_state.depth_gt, "Ground Truth"),
                 (st.session_state.depth_in, "Input"),
-                (st.session_state.depth_initialize, "Initialize"),
-                (st.session_state.depth_refine, "Refine")
+                (st.session_state.depth_initialize, "Initialize")
             ]
 
             for i, (depth, name) in enumerate(stages):
@@ -203,7 +257,8 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                 ax.axis('off')
                 plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            # 마지막 빈 공간
+            # 빈 공간들
+            axes[1, 1].axis('off')
             axes[1, 2].axis('off')
 
             plt.tight_layout()
@@ -216,17 +271,14 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
             gt_hole = st.session_state.depth_gt[st.session_state.hole_mask]
             in_hole = st.session_state.depth_in[st.session_state.hole_mask]
             init_hole = st.session_state.depth_initialize[st.session_state.hole_mask]
-            refine_hole = st.session_state.depth_refine[st.session_state.hole_mask]
 
             # MAE 계산
             mae_input = float(np.mean(np.abs(gt_hole - in_hole)))
             mae_init = float(np.mean(np.abs(gt_hole - init_hole)))
-            mae_refine = float(np.mean(np.abs(gt_hole - refine_hole)))
 
             # RMSE 계산
             rmse_input = float(np.sqrt(np.mean((gt_hole - in_hole)**2)))
             rmse_init = float(np.sqrt(np.mean((gt_hole - init_hole)**2)))
-            rmse_refine = float(np.sqrt(np.mean((gt_hole - refine_hole)**2)))
 
             # 메트릭 표시
             col1, col2 = st.columns(2)
@@ -234,18 +286,16 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
             with col1:
                 st.metric("MAE (Input)", f"{mae_input:.4f}")
                 st.metric("MAE (Initialize)", f"{mae_init:.4f}")
-                st.metric("MAE (Refine)", f"{mae_refine:.4f}")
 
             with col2:
                 st.metric("RMSE (Input)", f"{rmse_input:.4f}")
                 st.metric("RMSE (Initialize)", f"{rmse_init:.4f}")
-                st.metric("RMSE (Refine)", f"{rmse_refine:.4f}")
 
             # 개선도 그래프
             fig, ax = plt.subplots(figsize=(10, 6))
-            stages = ['Input', 'Initialize', 'Refine']
-            mae_values = [mae_input, mae_init, mae_refine]
-            rmse_values = [rmse_input, rmse_init, rmse_refine]
+            stages = ['Input', 'Initialize']
+            mae_values = [mae_input, mae_init]
+            rmse_values = [rmse_input, rmse_init]
 
             ax.plot(stages, mae_values, 'o-', label='MAE', linewidth=2, markersize=8)
             ax.plot(stages, rmse_values, 's-', label='RMSE', linewidth=2, markersize=8)
@@ -256,10 +306,79 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
 
             st.pyplot(fig)
 
+        with tab4:
+            st.subheader("⏱️ 처리 시간 분석")
+
+            if 'timing_info' in st.session_state:
+                timing = st.session_state.timing_info
+
+                # 시간 통계
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    st.metric("Initialize", f"{timing['init_time']:.3f}s")
+                with col2:
+                    st.metric("총 시간", f"{timing['total_time']:.3f}s")
+                with col3:
+                    st.metric("", "")
+                with col4:
+                    st.metric("", "")
+
+                # 시간 분포 파이 차트
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+                # 막대 차트
+                stages = ['Initialize']
+                times = [timing['init_time']]
+                colors = ['lightgreen']
+
+                bars = ax1.bar(stages, times, color=colors, alpha=0.7)
+                ax1.set_title('단계별 처리 시간', fontsize=14, fontweight='bold')
+                ax1.set_ylabel('처리 시간 (초)', fontsize=12)
+
+                for bar, time_val in zip(bars, times):
+                    height = bar.get_height()
+                    ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                             f'{time_val:.3f}s', ha='center', va='bottom', fontweight='bold')
+
+                # 파이 차트 (0이 아닌 값들만)
+                non_zero_times = [(stage, time_val) for stage, time_val in zip(stages, times) if time_val > 0]
+                if non_zero_times:
+                    labels, values = zip(*non_zero_times)
+                    ax2.pie(values, labels=labels, autopct='%1.1f%%', startangle=90, colors=colors[:len(values)])
+                    ax2.set_title('처리 시간 비율', fontsize=14, fontweight='bold')
+
+                plt.tight_layout()
+                st.pyplot(fig)
+
+                # 성능 분석
+                st.subheader("📈 성능 분석")
+
+                if timing['total_time'] > 0:
+                    init_ratio = timing['init_time'] / timing['total_time'] * 100
+
+                    st.write(f"**Initialize 단계**가 전체 처리 시간의 {init_ratio:.1f}%를 차지합니다.")
+                    st.info("💡 Initialize 단계가 주요 연산입니다. Log-Poisson completion이 핵심 처리입니다.")
+
+                # 처리 속도 분석
+                st.subheader("🚀 처리 속도 분석")
+
+                # 픽셀당 처리 시간 계산
+                total_pixels = st.session_state.depth_in.size
+                pixels_per_second = total_pixels / timing['total_time'] if timing['total_time'] > 0 else 0
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("총 픽셀 수", f"{total_pixels:,}")
+                    st.metric("픽셀/초", f"{pixels_per_second:,.0f}")
+                with col2:
+                    st.metric("이미지 크기", f"{st.session_state.depth_in.shape[0]}×{st.session_state.depth_in.shape[1]}")
+                    st.metric("초당 이미지", f"{1/timing['total_time']:.2f}" if timing['total_time'] > 0 else "0.00")
+
         # 결과 다운로드
         st.header("💾 결과 다운로드")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
 
         with col1:
             if st.button("Initialize 결과 다운로드"):
@@ -277,22 +396,6 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                     mime="image/png"
                 )
 
-        with col2:
-            if st.button("Refine 결과 다운로드"):
-                img_refine = (st.session_state.depth_refine * 255).astype(np.uint8)
-                pil_img = Image.fromarray(img_refine)
-
-                buf = io.BytesIO()
-                pil_img.save(buf, format='PNG')
-                buf.seek(0)
-
-                st.download_button(
-                    label="Refine 결과 다운로드",
-                    data=buf.getvalue(),
-                    file_name="refine_result.png",
-                    mime="image/png"
-                )
-
 else:
     # 데이터가 로드되지 않은 경우
     st.info("👈 사이드바에서 데이터를 선택하고 생성하거나 업로드하세요.")
@@ -306,41 +409,29 @@ else:
     - **이미지 업로드**: 직접 깊이 맵 이미지를 업로드하여 사용
 
     ### 2. 파라미터 조정
-    - **Inpaint 설정**: 홀 영역을 채우는 방법 선택
-    - **Initialize 설정**: 초기화 단계의 가중치 조정
-    - **Refine 설정**: 정제 단계의 가중치 및 반복 수 조정
+    - **Initialize 설정**: Log-Poisson completion의 가중치 조정
 
     ### 3. 결과 확인
-    - **3단계 파이프라인**: 전체 과정의 시각화
+    - **1단계 파이프라인**: 전체 과정의 시각화
     - **단계별 비교**: 각 단계별 결과 비교
     - **성능 메트릭**: 정량적 성능 평가
 
     ### 4. 결과 다운로드
-    - 각 단계별 결과를 PNG 이미지로 다운로드 가능
+    - Initialize 결과를 PNG 이미지로 다운로드 가능
     """)
 
     # 알고리즘 설명
     st.header("🔬 알고리즘 설명")
 
     st.markdown("""
-    ### 3단계 파이프라인
+    ### 1단계 파이프라인
 
-    1. **Inpaint 단계**
-       - Fast Marching Method: 거리 기반 가중 평균
-       - Harmonic Inpainting: 반복적 라플라시안 방정식 해결
-       - 홀 영역에 초기 값을 채워넣음
-
-    2. **Initialize 단계**
+    1. **Initialize 단계**
        - Log-Poisson completion 사용
        - 그래디언트 정합과 스무딩을 통한 초기화
-       - 더 정교한 깊이 분포 생성
-
-    3. **Refine 단계**
-       - 가우스-뉴턴 방법 사용
-       - 노멀 벡터 정합을 통한 최종 정제
-       - 가장 높은 품질의 결과 생성
+       - 홀 영역을 정교하게 채우는 깊이 분포 생성
     """)
 
 # 푸터
 st.markdown("---")
-st.markdown("**Depth Completion Pipeline** - 3단계 깊이 완성 시스템")
+st.markdown("**Depth Completion Pipeline** - 1단계 깊이 완성 시스템")
