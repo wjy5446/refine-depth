@@ -1,6 +1,7 @@
 import numpy as np
 import time
 from initialization import initial_guess_logpoisson_completion
+from utils import compute_normals_from_depth
 
 
 def depth_completion(
@@ -12,6 +13,7 @@ def depth_completion(
     K: np.ndarray | None,  # 카메라 내파라미터
     lambda_normal_edge: float = 0.0,  # 노멀 기반 엣지 가중치 강도
     lambda_screen_init: float = 1.0,  # 초기화 시 known에 대한 스크린 강도
+    refine_with_normals: bool = False,  # 1차 결과 기반 노멀 재활용 여부
     # 추가 파라미터들
     lambda_grad: float = 3.0,  # 그래디언트 가중치
     lambda_smooth: float = 0.3,  # 스무딩 가중치
@@ -33,6 +35,7 @@ def depth_completion(
         K: 카메라 내부 파라미터 - 선택사항
         lambda_normal_edge: 노멀 유사도 기반 엣지 가중치 강도
         lambda_screen_init: 초기화 시 known 영역에 대한 스크린 강도
+        refine_with_normals: True이면 1차 결과로 추정한 노멀을 사용해 한 번 더 보정
         lambda_grad: 그래디언트 일관성에 대한 가중치
         lambda_smooth: 스무딩에 대한 가중치
         edge_alpha: 엣지 보존 강도
@@ -48,7 +51,8 @@ def depth_completion(
     # 시간 측정을 위한 딕셔너리 초기화
     timing_info = {
         'init_time': 0.0,
-        'total_time': 0.0
+        'refine_time': 0.0,
+        'total_time': 0.0,
     }
 
     total_start_time = time.time()
@@ -76,6 +80,29 @@ def depth_completion(
     )
     init_end_time = time.time()
     timing_info['init_time'] = init_end_time - init_start_time
+
+    # Optional second pass using normals estimated from the first result
+    if refine_with_normals and n_guide is None and lambda_normal_edge > 0:
+        if K is None:
+            raise ValueError("K is required to compute normals for refinement")
+        refine_start = time.time()
+        n_est = compute_normals_from_depth(depth_initialize, K)
+        depth_initialize = initial_guess_logpoisson_completion(
+            depth_in=depth_initialize,
+            known_mask=known_mask,
+            hole_mask=hole_mask,
+            guide_gray=guide_gray,
+            n_guide=n_est,
+            lambda_grad=lambda_grad,
+            lambda_smooth=lambda_smooth,
+            edge_alpha=edge_alpha,
+            lambda_normal_edge=lambda_normal_edge,
+            tol=tol,
+            maxiter=maxiter,
+            clip_min=clip_min,
+            clip_max=clip_max,
+        )
+        timing_info['refine_time'] = time.time() - refine_start
 
     total_end_time = time.time()
     timing_info['total_time'] = total_end_time - total_start_time
