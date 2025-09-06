@@ -5,6 +5,41 @@ from utils import make_intrinsics, compute_normals_from_depth
 from main import depth_completion
 
 
+# 한글 폰트 설정
+def setup_korean_font():
+    """한글 폰트를 설정합니다."""
+    try:
+        # Windows에서 사용 가능한 한글 폰트들
+        korean_fonts = [
+            'Malgun Gothic',  # 맑은 고딕
+            'NanumGothic',    # 나눔고딕
+            'Batang',         # 바탕
+            'Gulim',          # 굴림
+            'Dotum',          # 돋움
+            'Arial Unicode MS'
+        ]
+
+        for font_name in korean_fonts:
+            try:
+                plt.rcParams['font.family'] = font_name
+                plt.rcParams['axes.unicode_minus'] = False
+                return True
+            except Exception:
+                continue
+
+        # 폰트를 찾지 못한 경우 기본 설정
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        return False
+
+    except Exception as e:
+        print(f"폰트 설정 중 오류 발생: {e}")
+        return False
+
+# 한글 폰트 설정 적용
+setup_korean_font()
+
+
 def create_synthetic_scene_with_holes(H=180, W=240, seed=0,
                                       noise_sigma=0.25,
                                       hole_mode="mixed"):

@@ -12,6 +12,14 @@ def depth_completion(
     K: np.ndarray | None,  # 카메라 내파라미터
     lambda_normal_edge: float = 0.0,  # 노멀 기반 엣지 가중치 강도
     lambda_screen_init: float = 1.0,  # 초기화 시 known에 대한 스크린 강도
+    # 추가 파라미터들
+    lambda_grad: float = 3.0,  # 그래디언트 가중치
+    lambda_smooth: float = 0.3,  # 스무딩 가중치
+    edge_alpha: float = 6.0,  # 엣지 강도
+    tol: float = 1e-4,  # 수렴 기준
+    maxiter: int = 300,  # 최대 반복수
+    clip_min: float = 0.0,  # 최소값 클리핑
+    clip_max: float | None = None,  # 최대값 클리핑
 ) -> tuple[np.ndarray, dict]:
     """
     깊이 완성 메인 파이프라인: initialize
@@ -25,6 +33,13 @@ def depth_completion(
         K: 카메라 내부 파라미터 - 선택사항
         lambda_normal_edge: 노멀 유사도 기반 엣지 가중치 강도
         lambda_screen_init: 초기화 시 known 영역에 대한 스크린 강도
+        lambda_grad: 그래디언트 일관성에 대한 가중치
+        lambda_smooth: 스무딩에 대한 가중치
+        edge_alpha: 엣지 보존 강도
+        tol: 수렴 판정 기준
+        maxiter: 최대 반복 횟수
+        clip_min: 깊이 값의 최소값 제한
+        clip_max: 깊이 값의 최대값 제한
 
     Returns:
         (initialize_result, timing_info) 튜플
@@ -50,14 +65,14 @@ def depth_completion(
         hole_mask=hole_mask,
         guide_gray=guide_gray,
         n_guide=n_guide,
-        lambda_grad=3.0,
-        lambda_smooth=0.3,
-        edge_alpha=6.0,
+        lambda_grad=lambda_grad,
+        lambda_smooth=lambda_smooth,
+        edge_alpha=edge_alpha,
         lambda_normal_edge=lambda_normal_edge,
-        tol=1e-4,
-        maxiter=300,
-        clip_min=0.0,
-        clip_max=None
+        tol=tol,
+        maxiter=maxiter,
+        clip_min=clip_min,
+        clip_max=clip_max
     )
     init_end_time = time.time()
     timing_info['init_time'] = init_end_time - init_start_time
