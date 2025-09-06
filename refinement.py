@@ -148,17 +148,31 @@ def refine_depth_match_normals_gn_completion(
     Lh_Rh = hole_mask[:, :-1] & hole_mask[:, 1:]
     Uh_Dh = hole_mask[:-1, :] & hole_mask[1:, :]
 
-    # 숫자 편미분에서 사용할 perturb 사이즈
-    def _perturb_amount(val: np.ndarray) -> np.ndarray:
-        return np.maximum(cfg.delta_eps_frac * np.maximum(val, 1e-3), 1e-6)
-
     K_inv = np.linalg.inv(K).astype(np.float32)
+    rays = _depth_to_points(np.ones((H, W), np.float32), K_inv)
 
     for it in range(cfg.gn_iters):
         # ---------- 1) 노멀 및 잔차 ----------
-        n_curr = _normals_from_depth(z, K, use_central=cfg.use_central_diff)  # (H,W,3)
+        X = z[..., None] * rays
+        if not cfg.use_central_diff:
+            raise NotImplementedError("Only central difference is supported")
+        dXu = np.zeros_like(X)
+        dXv = np.zeros_like(X)
+        dXu[:, 1:-1, :] = 0.5 * (X[:, 2:, :] - X[:, :-2, :])
+        dXu[:, 0, :] = X[:, 1, :] - X[:, 0, :]
+        dXu[:, -1, :] = X[:, -1, :] - X[:, -2, :]
+
+        dXv[1:-1, :, :] = 0.5 * (X[2:, :, :] - X[:-2, :, :])
+        dXv[0, :, :] = X[1, :, :] - X[0, :, :]
+        dXv[-1, :, :] = X[-1, :, :] - X[-2, :, :]
+
+        n = np.cross(dXu, dXv)
+        norm = np.linalg.norm(n, axis=2)
+        n_curr = n / (norm[..., None] + 1e-12)
+
         # dot residual r = 1 - n·n_g (작을수록 좋음)
-        r_full = 1.0 - np.sum(n_curr * n_guide, axis=2)                       # (H,W)
+        r_full = 1.0 - np.sum(n_curr * n_guide, axis=2)
+
         # ROI 샘플링 (stride) - 계산량 절약
         stride = max(1, int(cfg.normal_stride))
         sample_mask = np.zeros_like(hole_mask)
@@ -176,70 +190,101 @@ def refine_depth_match_normals_gn_completion(
         else:
             w_normal = np.ones(M, dtype=np.float32)
 
-        # ---------- 2) J_normal 수치미분(5-point stencil) ----------
-        # 각 잔차 r(y,x)는 z[y,x], z[y±1,x], z[y,x±1]에만 의해 변한다고 가정
-        rows = []
-        data = []
-        cols = []
-        b_norm = []
+        # ---------- 2) J_normal Jacobian (vectorized) ----------
+        n_dot_ng = np.sum(n_curr * n_guide, axis=2)
 
-        # 미리 현재 r_p 및 perturb 크기 준비
-        r0 = r_full[normal_roi].astype(np.float32)
-        # 각 이웃의 (dy,dx)
-        nbrs = [(0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)]
+        def dn_to_dr(dn: np.ndarray) -> np.ndarray:
+            dn_dot_ng = np.sum(dn * n_guide, axis=2)
+            n_hat_dot_dn = np.sum(n_curr * dn, axis=2)
+            return -(dn_dot_ng - n_hat_dot_dn * n_dot_ng) / (norm + 1e-12)
 
-        # perturb용 공용 z buffer를 카피하지 않고 in-place로 조정/복구
-        # 안전을 위해 복사본 하나 유지
-        z_buf = z
+        dn_c = np.zeros_like(n)
+        dn_e = np.zeros_like(n)
+        dn_w = np.zeros_like(n)
+        dn_s = np.zeros_like(n)
+        dn_n = np.zeros_like(n)
 
-        for i in range(M):
-            y = ys[i]
-            x = xs[i]
-            # J 행 인덱스
-            row_id = i
-            r_base = r0[i]
-            w_i = np.sqrt(cfg.lambda_normal) * np.sqrt(w_normal[i])
+        # center contributions (boundaries)
+        dn_c[:, 0, :] += np.cross(-rays[:, 0, :], dXv[:, 0, :])
+        dn_c[:, -1, :] += np.cross(rays[:, -1, :], dXv[:, -1, :])
+        dn_c[0, :, :] += np.cross(dXu[0, :, :], -rays[0, :, :])
+        dn_c[-1, :, :] += np.cross(dXu[-1, :, :], rays[-1, :, :])
 
-            for (dy, dx) in nbrs:
-                yy = y + dy
-                xx = x + dx
-                if yy < 0 or yy >= H or xx < 0 or xx >= W:
-                    continue
-                col = idx_map[yy, xx]
-                if col < 0:  # known이면 변수 아님
-                    continue
+        # east/west neighbors
+        dn_e[:, :-1, :] = np.cross(0.5 * rays[:, 1:, :], dXv[:, :-1, :])
+        dn_w[:, 1:, :] = np.cross(-0.5 * rays[:, :-1, :], dXv[:, 1:, :])
 
-                # 상대 perturb
-                dz = _perturb_amount(z_buf[yy, xx])
-                z_buf[yy, xx] += dz
-                # r(y,x) 재계산 (이 픽셀의 r만 필요하므로 국소 재계산을 하고 싶지만
-                # 간단함을 위해 노멀 전체를 다시 계산 -> 정확하지만 느릴 수 있음)
-                n_tmp = _normals_from_depth(z_buf, K, use_central=cfg.use_central_diff)
-                r_pert = 1.0 - np.dot(n_tmp[y, x, :], n_guide[y, x, :])
-                # 복구
-                z_buf[yy, xx] -= dz
+        # south/north neighbors
+        dn_s[:-1, :, :] = np.cross(dXu[:-1, :, :], 0.5 * rays[1:, :, :])
+        dn_n[1:, :, :] = np.cross(dXu[1:, :, :], -0.5 * rays[:-1, :, :])
 
-                # dr/dz ≈ (r_pert - r_base)/dz
-                j = (r_pert - r_base) / (dz + 1e-12)
+        dr_c = dn_to_dr(dn_c)
+        dr_e = dn_to_dr(dn_e)
+        dr_w = dn_to_dr(dn_w)
+        dr_s = dn_to_dr(dn_s)
+        dr_n = dn_to_dr(dn_n)
 
-                rows.append(row_id)
-                cols.append(col)
-                data.append(w_i * j)
+        w_i = np.sqrt(cfg.lambda_normal) * np.sqrt(w_normal)
+        rows_list = []
+        cols_list = []
+        data_list = []
 
-            # RHS: sqrt(λ_n)*sqrt(w_i)*( - r_base )  (표준 GN: J δ = -r)
-            b_norm.append(w_i * (r_base * -1.0))
+        row_ids = np.arange(M, dtype=np.int32)
+
+        # center
+        cols_c = idx_map[ys, xs]
+        data_c = w_i * dr_c[ys, xs]
+        rows_list.append(row_ids)
+        cols_list.append(cols_c)
+        data_list.append(data_c)
+
+        # east
+        mask = xs + 1 < W
+        cols_e = idx_map[ys[mask], xs[mask] + 1]
+        valid = cols_e >= 0
+        rows_list.append(row_ids[mask][valid])
+        cols_list.append(cols_e[valid])
+        data_list.append((w_i * dr_e[ys, xs])[mask][valid])
+
+        # west
+        mask = xs - 1 >= 0
+        cols_w = idx_map[ys[mask], xs[mask] - 1]
+        valid = cols_w >= 0
+        rows_list.append(row_ids[mask][valid])
+        cols_list.append(cols_w[valid])
+        data_list.append((w_i * dr_w[ys, xs])[mask][valid])
+
+        # south
+        mask = ys + 1 < H
+        cols_s = idx_map[ys[mask] + 1, xs[mask]]
+        valid = cols_s >= 0
+        rows_list.append(row_ids[mask][valid])
+        cols_list.append(cols_s[valid])
+        data_list.append((w_i * dr_s[ys, xs])[mask][valid])
+
+        # north
+        mask = ys - 1 >= 0
+        cols_n = idx_map[ys[mask] - 1, xs[mask]]
+        valid = cols_n >= 0
+        rows_list.append(row_ids[mask][valid])
+        cols_list.append(cols_n[valid])
+        data_list.append((w_i * dr_n[ys, xs])[mask][valid])
+
+        rows = np.concatenate(rows_list)
+        cols = np.concatenate(cols_list)
+        data = np.concatenate(data_list)
+        b_norm = w_i * (-r_full[normal_roi])
 
         # J_normal, b_normal
         if len(rows) == 0:
-            # 노멀 항이 모두 known에만 걸렸다면 스킵
             J_normal = coo_matrix((0, N), dtype=np.float32)
             b_normal = np.zeros((0,), dtype=np.float32)
         else:
-            J_normal = coo_matrix((np.array(data, dtype=np.float32),
-                                   (np.array(rows, dtype=np.int32),
-                                    np.array(cols, dtype=np.int32))),
+            J_normal = coo_matrix((data.astype(np.float32),
+                                   (rows.astype(np.int32),
+                                    cols.astype(np.int32))),
                                   shape=(M, N)).tocsr()
-            b_normal = np.array(b_norm, dtype=np.float32)
+            b_normal = b_norm.astype(np.float32)
 
         # ---------- 3) 스무딩/스크린 선형항 (z 기준) ----------
         rows_ls = []
