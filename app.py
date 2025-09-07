@@ -1,6 +1,6 @@
 """
 깊이 완성 파이프라인 Streamlit 앱
-Log-Poisson completion을 사용한 깊이 완성 시스템
+Log-Poisson completion + Plane-based refinement을 사용한 깊이 완성 시스템
 """
 
 import streamlit as st
@@ -14,8 +14,8 @@ from test_visualization import create_synthetic_scene_with_holes
 from ui_components import (
     setup_korean_font, render_parameter_sidebar,
     render_matplotlib_visualization, render_plotly_3d_visualization,
-    render_performance_metrics, render_download_buttons,
-    render_initialize_parameter_sidebar  # render_interactive_initialize_parameters 제거
+    render_performance_metrics,
+    render_depth_completion_parameter_sidebar
 )
 
 # 앱 시작 시 한글 폰트 설정
@@ -32,17 +32,18 @@ st.set_page_config(
 # 메인 타이틀과 설명
 st.title("🔍 깊이 완성 파이프라인")
 st.markdown("""
-**Log-Poisson completion을 사용한 고품질 깊이 완성 시스템**
+**Log-Poisson completion + Plane-based refinement을 사용한 고품질 깊이 완성 시스템**
 
 이 앱은 깊이 맵의 홀(구멍) 영역을 자동으로 복원하는 AI 기반 파이프라인입니다.
+- **1단계**: Log-Poisson completion으로 초기화
+- **2단계**: Plane-based linear refinement로 정련
+
 합성 데이터를 생성하거나 실제 깊이 맵을 업로드하여 테스트할 수 있습니다.
 """)
 
-
 # 파라미터 설정
 params = render_parameter_sidebar()
-initialize_params = render_initialize_parameter_sidebar()
-algorithm_params = {'lambda_normal_edge': 0.0}  # 기본값으로 설정
+depth_completion_params = render_depth_completion_parameter_sidebar()
 
 # 데이터 타입에 따른 처리
 if params['data_type'] == "합성 데이터":
@@ -123,7 +124,7 @@ else:
 if 'data_loaded' in st.session_state and st.session_state.data_loaded:
 
     # 실행 버튼
-    if st.button("🔧 파이프라인 실행", type="primary", use_container_width=True):
+    if st.button("🔧 Depth Completion 파이프라인 실행", type="primary", use_container_width=True):
         # 진행 상황 표시
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -131,27 +132,34 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
         # 전체 시작 시간
         total_start_time = time.time()
 
-        # 1단계: Initialize
-        status_text.text("🔄 1단계: Initialize 실행 중...")
+        # Depth Completion 파이프라인 실행
+        status_text.text("🔧 Depth Completion 파이프라인 실행 중...")
         progress_bar.progress(50)
 
         start_time = time.time()
-        depth_initialize, timing_info = depth_completion(
-            st.session_state.depth_in,
-            st.session_state.refine_roi,
-            st.session_state.valid_mask,
-            st.session_state.normals_gt,
-            st.session_state.guide_gray,
-            st.session_state.K,
-            lambda_normal_edge=initialize_params['lambda_normal_edge'],
-            lambda_screen_init=1.0,  # 기본값
-            lambda_grad=initialize_params['lambda_grad'],
-            lambda_smooth=initialize_params['lambda_smooth'],
-            edge_alpha=initialize_params['edge_alpha'],
-            tol=initialize_params['tol'],
-            maxiter=initialize_params['maxiter'],
-            clip_min=initialize_params['clip_min'],
-            clip_max=initialize_params['clip_max']
+        depth_initialize, depth_refined, timing_info = depth_completion(
+            depth_in=st.session_state.depth_in,
+            refine_roi=st.session_state.refine_roi,
+            valid_mask=st.session_state.valid_mask,
+            n_guide=st.session_state.normals_gt,
+            guide_gray=st.session_state.guide_gray,
+            K=st.session_state.K,
+            # 초기화 파라미터
+            lambda_init_grad=depth_completion_params['lambda_init_grad'],
+            lambda_init_smooth=depth_completion_params['lambda_init_smooth'],
+            lambda_init_normal_edge=depth_completion_params['lambda_init_normal_edge'],
+            # 정련 파라미터 (새로운 refine.py 기반)
+            lambda_refine_normal=depth_completion_params['lambda_refine_normal'],
+            lambda_refine_smooth=depth_completion_params['lambda_refine_smooth'],
+            lambda_refine_data=depth_completion_params['lambda_refine_data'],
+            lambda_refine_screen=depth_completion_params['lambda_refine_screen'],
+            # 공통 파라미터
+            edge_alpha=depth_completion_params['edge_alpha'],
+            solver=depth_completion_params['solver'],
+            tol=depth_completion_params['tol'],
+            maxiter=depth_completion_params['maxiter'],
+            clip_min=depth_completion_params['clip_min'],
+            clip_max=depth_completion_params['clip_max']
         )
         end_time = time.time()
 
@@ -164,10 +172,20 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
 
         # 세션 상태에 결과 저장
         st.session_state.depth_initialize = depth_initialize
+        st.session_state.depth_refined = depth_refined
         st.session_state.results_ready = True
         st.session_state.timing_info = timing_info
 
-        st.success(f"🎉 파이프라인 실행이 완료되었습니다! (소요시간: {total_time:.2f}초)")
+        st.success(f"🎉 Depth Completion 파이프라인 실행이 완료되었습니다! (소요시간: {total_time:.2f}초)")
+
+        # 타이밍 정보 표시
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("초기화 시간", f"{timing_info['init_time']:.2f}초")
+        with col2:
+            st.metric("정련 시간", f"{timing_info['refine_time']:.2f}초")
+        with col3:
+            st.metric("총 시간", f"{timing_info['total_time']:.2f}초")
 
     # 결과 표시
     if 'results_ready' in st.session_state and st.session_state.results_ready:
@@ -189,13 +207,15 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                 render_matplotlib_visualization(
                     st.session_state.depth_gt,
                     st.session_state.depth_in,
-                    st.session_state.depth_initialize
+                    st.session_state.depth_initialize,
+                    st.session_state.depth_refined
                 )
             else:  # Plotly 3D 인터랙티브
                 render_plotly_3d_visualization(
                     st.session_state.depth_gt,
                     st.session_state.depth_in,
-                    st.session_state.depth_initialize
+                    st.session_state.depth_initialize,
+                    st.session_state.depth_refined
                 )
 
         with tab2:
@@ -203,19 +223,17 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                 st.session_state.depth_gt,
                 st.session_state.depth_in,
                 st.session_state.depth_initialize,
+                st.session_state.depth_refined,
                 st.session_state.hole_mask
             )
 
-        # 다운로드 버튼
-        render_download_buttons(
-            st.session_state.depth_gt,
-            st.session_state.depth_in,
-            st.session_state.depth_initialize
-        )
-
-# 실시간 파라미터 조절 UI 제거
-# if st.session_state.data_loaded:
-#     render_interactive_initialize_parameters(...)
+        # 다운로드 버튼 제거
+        # render_download_buttons(
+        #     st.session_state.depth_gt,
+        #     st.session_state.depth_in,
+        #     st.session_state.depth_initialize,
+        #     st.session_state.depth_refined
+        # )
 
 else:
     st.info("📁 데이터를 먼저 로드해주세요.")
@@ -225,7 +243,7 @@ st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: #666;'>
-    <p>🔍 깊이 완성 파이프라인 | Log-Poisson completion 기반</p>
+    <p>🔍 깊이 완성 파이프라인 | Log-Poisson completion + Plane-based refinement</p>
     </div>
     """,
     unsafe_allow_html=True

@@ -174,258 +174,314 @@ def render_initialize_parameter_sidebar():
     }
 
 
-def render_matplotlib_visualization(depth_gt, depth_in, depth_initialize):
+def render_depth_completion_parameter_sidebar():
+    """Depth Completion 파이프라인 파라미터 설정 사이드바를 렌더링합니다."""
+    st.sidebar.header("⚙️ Depth Completion 파라미터")
+
+    # 초기화 단계 파라미터
+    st.sidebar.subheader("🔄 초기화 단계 파라미터")
+    lambda_init_grad = st.sidebar.slider(
+        "λ_init_grad (초기화 그래디언트 가중치)",
+        0.1, 10.0, 3.0, 0.1,
+        help="초기화 단계에서 그래디언트 일관성에 대한 가중치"
+    )
+
+    lambda_init_smooth = st.sidebar.slider(
+        "λ_init_smooth (초기화 스무딩 가중치)",
+        0.01, 2.0, 0.2, 0.01,
+        help="초기화 단계에서 스무딩에 대한 가중치"
+    )
+
+    lambda_init_normal_edge = st.sidebar.slider(
+        "λ_init_normal_edge (초기화 노멀 엣지 가중치)",
+        0.0, 5.0, 0.0, 0.1,
+        help="초기화 단계에서 노멀 벡터 기반 엣지 가중치"
+    )
+
+    # 정련 단계 파라미터 (새로운 refine.py 기반)
+    st.sidebar.subheader("🔧 정련 단계 파라미터")
+    lambda_refine_normal = st.sidebar.slider(
+        "λ_refine_normal (법선 정합 가중치)",
+        0.1, 10.0, 3.0, 0.1,
+        help="정련 단계에서 법선 정합에 대한 가중치"
+    )
+
+    lambda_refine_smooth = st.sidebar.slider(
+        "λ_refine_smooth (스무딩 가중치)",
+        0.01, 2.0, 0.2, 0.01,
+        help="정련 단계에서 스무딩에 대한 가중치"
+    )
+
+    lambda_refine_data = st.sidebar.slider(
+        "λ_refine_data (경계 anchor 가중치)",
+        0.01, 2.0, 0.5, 0.01,
+        help="정련 단계에서 경계 anchor에 대한 가중치"
+    )
+
+    lambda_refine_screen = st.sidebar.slider(
+        "λ_refine_screen (초기화 anchor 가중치)",
+        1e-5, 1e-2, 1e-3, 1e-5,
+        format="%.0e",
+        help="정련 단계에서 초기화 anchor에 대한 가중치"
+    )
+
+    # 공통 파라미터
+    st.sidebar.subheader("⚙️ 공통 파라미터")
+    edge_alpha = st.sidebar.slider(
+        "Edge Alpha (엣지 강도)",
+        1.0, 20.0, 6.0, 0.5,
+        help="엣지 보존 강도. 높을수록 엣지를 더 잘 보존"
+    )
+
+    solver = st.sidebar.selectbox(
+        "솔버 선택",
+        ["lsmr", "cg"],
+        help="선형 시스템 솔버 선택"
+    )
+
+    tol = st.sidebar.number_input(
+        "Tolerance (수렴 기준)",
+        1e-6, 1e-2, 1e-4, 1e-6,
+        format="%.0e",
+        help="수렴 판정 기준. 작을수록 더 정확하지만 느림"
+    )
+
+    maxiter = st.sidebar.slider(
+        "Max Iterations (최대 반복수)",
+        50, 1000, 300, 10,
+        help="최대 반복 횟수. 높을수록 더 정확하지만 느림"
+    )
+
+    # 클리핑 파라미터
+    st.sidebar.subheader("📏 클리핑 파라미터")
+    clip_min = st.sidebar.number_input(
+        "최소값 클리핑",
+        0.0, 10.0, 0.0, 0.1,
+        help="깊이 값의 최소값 제한"
+    )
+
+    clip_max_enabled = st.sidebar.checkbox("최대값 클리핑 활성화", value=False)
+    clip_max = None
+    if clip_max_enabled:
+        clip_max = st.sidebar.number_input(
+            "최대값 클리핑",
+            1.0, 50.0, 10.0, 0.1,
+            help="깊이 값의 최대값 제한"
+        )
+
+    return {
+        # 초기화 파라미터
+        'lambda_init_grad': lambda_init_grad,
+        'lambda_init_smooth': lambda_init_smooth,
+        'lambda_init_normal_edge': lambda_init_normal_edge,
+        # 정련 파라미터 (새로운 refine.py 기반)
+        'lambda_refine_normal': lambda_refine_normal,
+        'lambda_refine_smooth': lambda_refine_smooth,
+        'lambda_refine_data': lambda_refine_data,
+        'lambda_refine_screen': lambda_refine_screen,
+        # 공통 파라미터
+        'edge_alpha': edge_alpha,
+        'solver': solver,
+        'tol': tol,
+        'maxiter': maxiter,
+        'clip_min': clip_min,
+        'clip_max': clip_max
+    }
+
+
+def render_matplotlib_visualization(depth_gt, depth_in, depth_initialize, depth_refined):
     """Matplotlib을 사용한 정적 시각화를 렌더링합니다."""
     # 2D 뷰 비교
-    fig, axes = plt.subplots(1, 4, figsize=(15, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
     stages = [
         (depth_gt, "Ground Truth"),
         (depth_in, "Input"),
-        (depth_initialize, "Initialize")
+        (depth_initialize, "Initialize"),
+        (depth_refined, "Refined"),
+        (np.abs(depth_initialize - depth_gt), "|Initialize - GT|"),
+        (np.abs(depth_refined - depth_gt), "|Refined - GT|")
     ]
 
     for i, (depth, name) in enumerate(stages):
-        ax = axes[i]
-        im = ax.imshow(depth, cmap='viridis', vmin=0, vmax=3)
+        row, col = i // 3, i % 3
+        ax = axes[row, col]
+
+        if "|" in name:  # 차이 맵
+            im = ax.imshow(depth, cmap='hot', vmin=0, vmax=np.percentile(depth, 95))
+        else:  # 일반 깊이 맵
+            im = ax.imshow(depth, cmap='viridis', vmin=0, vmax=3)
+
         ax.set_title(name)
         ax.axis('off')
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # Initialize와 Ground Truth의 차이
-    diff_map = np.abs(depth_initialize - depth_gt)
-    ax = axes[3]
-    im = ax.imshow(diff_map, cmap='hot', vmin=0, vmax=np.percentile(diff_map, 95))
-    ax.set_title("|Initialize - GT|")
-    ax.axis('off')
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 
-def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize):
+def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_refined):
     """Plotly를 사용한 3D 인터랙티브 시각화를 렌더링합니다."""
-    st.subheader("3D 깊이 맵 시각화")
+    H, W = depth_gt.shape
 
-    # 3D 시각화 옵션
-    col1, col2 = st.columns(2)
-    with col1:
-        point_size = st.slider("포인트 크기", 1, 10, 3)
-    with col2:
-        sample_rate = st.slider("샘플링 비율", 1, 10, 3)
-
-    # 데이터 준비
-    stages_data = [
-        (depth_gt, "Ground Truth", "red"),
-        (depth_in, "Input", "blue"),
-        (depth_initialize, "Initialize", "green")
-    ]
-
-    # 차이 맵 계산
-    diff_map = np.abs(depth_initialize - depth_gt)
-
-    # 3D 서브플롯 생성
+    # 서브플롯 생성 (1행 4열)
     fig = make_subplots(
         rows=1, cols=4,
-        subplot_titles=("Ground Truth", "Input", "Initialize", "|Init - GT|"),
-        specs=[[{"type": "scatter3d"}, {"type": "scatter3d"}, {"type": "scatter3d"}, {"type": "scatter3d"}]]
+        subplot_titles=("Ground Truth", "Input", "Initialize", "Refined"),
+        specs=[[{'type': 'scatter3d'}, {'type': 'scatter3d'},
+               {'type': 'scatter3d'}, {'type': 'scatter3d'}]]
     )
 
-    for i, (depth, name, color) in enumerate(stages_data):
-        # 샘플링으로 포인트 수 줄이기
-        H, W = depth.shape
-        step = sample_rate
-        y_indices, x_indices = np.meshgrid(
-            np.arange(0, H, step),
-            np.arange(0, W, step),
-            indexing='ij'
-        )
+    # 각 단계별 데이터 준비
+    surfaces = [
+        (depth_gt, "Ground Truth"),
+        (depth_in, "Input"),
+        (depth_initialize, "Initialize"),
+        (depth_refined, "Refined")
+    ]
 
-        # 샘플링된 데이터
-        sampled_depth = depth[::step, ::step]
-        sampled_x = x_indices.flatten()
-        sampled_y = y_indices.flatten()
-        sampled_z = sampled_depth.flatten()
+    # 샘플링을 위한 스텝 크기 (성능을 위해)
+    step = max(1, min(H, W) // 50)  # 최대 50x50 포인트로 샘플링
 
-        # 유효한 깊이 값만 선택 (0이 아닌 값)
-        valid_mask = sampled_z > 0
-        x_valid = sampled_x[valid_mask]
-        y_valid = sampled_y[valid_mask]
-        z_valid = sampled_z[valid_mask]
+    for i, (depth, name) in enumerate(surfaces):
+        try:
+            # 샘플링된 좌표 생성
+            y_indices = np.arange(0, H, step)
+            x_indices = np.arange(0, W, step)
 
-        fig.add_trace(
-            go.Scatter3d(
-                x=x_valid,
-                y=y_valid,
-                z=z_valid,
-                mode='markers',
-                marker=dict(
-                    size=point_size,
-                    color=z_valid,
-                    colorscale='Viridis',
-                    opacity=0.8,
-                    colorbar=dict(title="Depth") if i == 0 else None
+            # 메시그리드 생성
+            X, Y = np.meshgrid(x_indices, y_indices)
+            Z = depth[::step, ::step]
+
+            # 유효한 포인트만 선택 (NaN이나 0이 아닌 값들)
+            valid_mask = np.isfinite(Z) & (Z > 0)
+
+            # 유효한 포인트가 있는지 확인
+            if np.sum(valid_mask) == 0:
+                # 유효한 포인트가 없으면 빈 trace 추가
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=[], y=[], z=[],
+                        mode='markers',
+                        name=name,
+                        showlegend=False
+                    ),
+                    row=1, col=i+1
+                )
+                continue
+
+            # 1D 배열로 변환
+            x_flat = X[valid_mask].flatten()
+            y_flat = Y[valid_mask].flatten()
+            z_flat = Z[valid_mask].flatten()
+
+            # 색상 매핑을 위한 정규화
+            if len(z_flat) > 0:
+                z_min, z_max = z_flat.min(), z_flat.max()
+                if z_max > z_min:
+                    z_normalized = (z_flat - z_min) / (z_max - z_min)
+                else:
+                    z_normalized = np.zeros_like(z_flat)
+            else:
+                z_normalized = np.array([])
+
+            fig.add_trace(
+                go.Scatter3d(
+                    x=x_flat,
+                    y=y_flat,
+                    z=z_flat,
+                    mode='markers',
+                    marker=dict(
+                        size=2,
+                        color=z_flat,
+                        colorscale='viridis',
+                        opacity=0.8,
+                        showscale=(i == 0),  # 첫 번째만 컬러바 표시
+                        colorbar=dict(title="Depth") if i == 0 else None,
+                        cmin=0,  # 색상 범위 설정
+                        cmax=3
+                    ),
+                    name=name,
+                    showlegend=False
                 ),
-                name=name,
-                text=[f"Depth: {z:.3f}" for z in z_valid],
-                hovertemplate=f"{name}<br>" +
-                             "X: %{x}<br>" +
-                             "Y: %{y}<br>" +
-                             "Depth: %{z:.3f}<br>" +
-                             "<extra></extra>"
-            ),
-            row=1, col=i+1
-        )
+                row=1, col=i+1
+            )
 
-    # 차이 맵 3D 시각화 (4번째 서브플롯)
-    H, W = diff_map.shape
-    step = sample_rate
-    y_indices, x_indices = np.meshgrid(
-        np.arange(0, H, step),
-        np.arange(0, W, step),
-        indexing='ij'
-    )
+        except Exception as e:
+            # 오류 발생 시 빈 trace 추가
+            print(f"Error processing {name}: {e}")
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[], y=[], z=[],
+                    mode='markers',
+                    name=name,
+                    showlegend=False
+                ),
+                row=1, col=i+1
+            )
 
-    # 샘플링된 차이 데이터
-    sampled_diff = diff_map[::step, ::step]
-    sampled_x = x_indices.flatten()
-    sampled_y = y_indices.flatten()
-    sampled_z = sampled_diff.flatten()
-
-    fig.add_trace(
-        go.Scatter3d(
-            x=sampled_x,
-            y=sampled_y,
-            z=sampled_z,
-            mode='markers',
-            marker=dict(
-                size=point_size,
-                color=z_valid,
-                colorscale='Hot',
-                opacity=0.8,
-                colorbar=dict(title="Error")
-            ),
-            name="|Init - GT|",
-            text=[f"Error: {z:.3f}" for z in z_valid],
-            hovertemplate="|Init - GT|<br>" +
-                         "X: %{x}<br>" +
-                         "Y: %{y}<br>" +
-                         "Error: %{z:.3f}<br>" +
-                         "<extra></extra>"
-        ),
-        row=1, col=4
-    )
-
-    # 3D 레이아웃 설정
+    # 레이아웃 업데이트
     fig.update_layout(
-        title="Depth Completion Results - Interactive 3D View",
+        title="3D Point Cloud 깊이 맵 비교",
         height=600,
         showlegend=False
     )
 
-    # 각 서브플롯의 축 설정
+    # 각 서브플롯의 카메라 설정
     for i in range(1, 5):
-        if i == 4:  # 차이 맵의 경우
-            fig.update_scenes(
-                xaxis_title="Width",
-                yaxis_title="Height",
-                zaxis_title="Error",
-                row=1, col=i
-            )
-        else:  # 깊이 맵의 경우
-            fig.update_scenes(
-                xaxis_title="Width",
-                yaxis_title="Height",
-                zaxis_title="Depth",
-                row=1, col=i
-            )
+        fig.update_scenes(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Depth",
+            camera=dict(
+                eye=dict(x=1.5, y=1.5, z=1.5)
+            ),
+            row=1, col=i
+        )
 
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_performance_metrics(depth_gt, depth_in, depth_initialize, hole_mask):
+def render_performance_metrics(depth_gt, depth_in, depth_initialize, depth_refined, hole_mask):
     """성능 메트릭을 렌더링합니다."""
-    st.subheader("성능 메트릭")
+    st.subheader("📈 성능 메트릭")
 
-    # 홀 영역에서의 메트릭 계산
-    gt_hole = depth_gt[hole_mask]
-    in_hole = depth_in[hole_mask]
-    init_hole = depth_initialize[hole_mask]
+    # 메트릭 계산
+    def calculate_metrics(pred, gt, mask):
+        valid_mask = np.isfinite(pred) & np.isfinite(gt) & mask
+        if np.sum(valid_mask) == 0:
+            return 0, 0, 0
 
-    # MAE 계산
-    mae_input = float(np.mean(np.abs(gt_hole - in_hole)))
-    mae_init = float(np.mean(np.abs(gt_hole - init_hole)))
+        pred_valid = pred[valid_mask]
+        gt_valid = gt[valid_mask]
 
-    # RMSE 계산
-    rmse_input = float(np.sqrt(np.mean((gt_hole - in_hole)**2)))
-    rmse_init = float(np.sqrt(np.mean((gt_hole - init_hole)**2)))
+        mae = np.mean(np.abs(pred_valid - gt_valid))
+        rmse = np.sqrt(np.mean((pred_valid - gt_valid) ** 2))
+
+        # 상관계수
+        corr = np.corrcoef(pred_valid, gt_valid)[0, 1] if len(pred_valid) > 1 else 0
+
+        return mae, rmse, corr
+
+    # 각 단계별 메트릭 계산
+    init_mae, init_rmse, init_corr = calculate_metrics(depth_initialize, depth_gt, hole_mask)
+    refine_mae, refine_rmse, refine_corr = calculate_metrics(depth_refined, depth_gt, hole_mask)
 
     # 메트릭 표시
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.metric("MAE (Input)", f"{mae_input:.4f}")
-        st.metric("MAE (Initialize)", f"{mae_init:.4f}")
-
-    with col2:
-        st.metric("RMSE (Input)", f"{rmse_input:.4f}")
-        st.metric("RMSE (Initialize)", f"{rmse_init:.4f}")
-
-    # 개선도 그래프
-    fig, ax = plt.subplots(figsize=(10, 6))
-    stages = ['Input', 'Initialize']
-    mae_values = [mae_input, mae_init]
-    rmse_values = [rmse_input, rmse_init]
-
-    ax.plot(stages, mae_values, 'o-', label='MAE', linewidth=2, markersize=8)
-    ax.plot(stages, rmse_values, 's-', label='RMSE', linewidth=2, markersize=8)
-    ax.set_title('Error Progression')
-    ax.set_ylabel('Error')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    st.pyplot(fig)
-
-
-def render_download_buttons(depth_gt, depth_in, depth_initialize):
-    """다운로드 버튼들을 렌더링합니다."""
-    st.subheader("📥 결과 다운로드")
-
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        # Ground Truth 다운로드
-        buffer = io.BytesIO()
-        np.save(buffer, depth_gt)
-        buffer.seek(0)
-        st.download_button(
-            label="Ground Truth 다운로드",
-            data=buffer.getvalue(),
-            file_name="depth_gt.npy",
-            mime="application/octet-stream"
-        )
+        st.metric("Initialize MAE", f"{init_mae:.4f}")
+        st.metric("Refined MAE", f"{refine_mae:.4f}")
+        st.metric("개선도", f"{((init_mae - refine_mae) / init_mae * 100):.1f}%")
 
     with col2:
-        # Input 다운로드
-        buffer = io.BytesIO()
-        np.save(buffer, depth_in)
-        buffer.seek(0)
-        st.download_button(
-            label="Input 다운로드",
-            data=buffer.getvalue(),
-            file_name="depth_input.npy",
-            mime="application/octet-stream"
-        )
+        st.metric("Initialize RMSE", f"{init_rmse:.4f}")
+        st.metric("Refined RMSE", f"{refine_rmse:.4f}")
+        st.metric("개선도", f"{((init_rmse - refine_rmse) / init_rmse * 100):.1f}%")
 
     with col3:
-        # Initialize 다운로드
-        buffer = io.BytesIO()
-        np.save(buffer, depth_initialize)
-        buffer.seek(0)
-        st.download_button(
-            label="Initialize 다운로드",
-            data=buffer.getvalue(),
-            file_name="depth_initialize.npy",
-            mime="application/octet-stream"
-        )
+        st.metric("Initialize 상관계수", f"{init_corr:.4f}")
+        st.metric("Refined 상관계수", f"{refine_corr:.4f}")
+        st.metric("개선도", f"{((refine_corr - init_corr) / abs(init_corr) * 100):.1f}%")
