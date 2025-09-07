@@ -16,9 +16,11 @@ def initial_guess_logpoisson_completion(
     known_mask: np.ndarray,
     hole_mask: np.ndarray,
     guide_gray: np.ndarray | None,
+    n_guide: np.ndarray | None = None,
     lambda_grad: float = 3.0,
     lambda_smooth: float = 0.2,
     edge_alpha: float = 6.0,
+    lambda_normal_edge: float = 0.0,
     tol: float = 1e-4,
     maxiter: int = 300,
     clip_min: float | None = 0.0,
@@ -32,6 +34,7 @@ def initial_guess_logpoisson_completion(
     Log-Poisson completion을 사용해 hole 영역만 변수를 두고 초기 깊이를 추정합니다.
     - (B) log-기울기 전파 (u_q - u_p = 0)
     - (C) 엣지-가중 스무딩
+    n_guide가 주어지면 법선 유사도를 이용한 추가 엣지 가중치를 적용합니다.
     """
     H, W = depth_in.shape
 
@@ -42,14 +45,17 @@ def initial_guess_logpoisson_completion(
         known_small = zoom(known_mask.astype(np.float32), sf, order=0) >= 0.5
         hole_small = zoom(hole_mask.astype(np.float32), sf, order=0) >= 0.5
         guide_small = None if guide_gray is None else zoom(guide_gray, sf, order=1)
+        n_small = None if n_guide is None else zoom(n_guide, (sf, sf, 1), order=1)
         low_res = initial_guess_logpoisson_completion(
             depth_small,
             known_small,
             hole_small,
             guide_small,
+            n_small,
             lambda_grad=lambda_grad,
             lambda_smooth=lambda_smooth,
             edge_alpha=edge_alpha,
+            lambda_normal_edge=lambda_normal_edge,
             tol=tol,
             maxiter=maxiter,
             clip_min=clip_min,
@@ -82,6 +88,14 @@ def initial_guess_logpoisson_completion(
     else:
         w_e_h = np.ones((H, W - 1), dtype=np.float32)
         w_e_v = np.ones((H - 1, W), dtype=np.float32)
+
+    if n_guide is not None:
+        n = n_guide.astype(np.float32)
+        n /= np.linalg.norm(n, axis=2, keepdims=True).clip(1e-6, None)
+        sim_h = np.abs(np.sum(n[:, :-1, :] * n[:, 1:, :], axis=2))
+        sim_v = np.abs(np.sum(n[:-1, :, :] * n[1:, :, :], axis=2))
+        w_e_h *= np.exp(-lambda_normal_edge * (1.0 - sim_h)).astype(np.float32)
+        w_e_v *= np.exp(-lambda_normal_edge * (1.0 - sim_v)).astype(np.float32)
 
     # Cache lookup
     cache_entry = None
@@ -239,9 +253,11 @@ def benchmark_initialization(
     known_mask: np.ndarray,
     hole_mask: np.ndarray,
     guide_gray: np.ndarray | None = None,
+    n_guide: np.ndarray | None = None,
     lambda_grad: float = 3.0,
     lambda_smooth: float = 0.2,
     edge_alpha: float = 6.0,
+    lambda_normal_edge: float = 0.0,
     tol: float = 1e-4,
     maxiter: int = 300,
     clip_min: float | None = 0.0,
@@ -260,9 +276,11 @@ def benchmark_initialization(
         known_mask,
         hole_mask,
         guide_gray,
+        n_guide,
         lambda_grad=lambda_grad,
         lambda_smooth=lambda_smooth,
         edge_alpha=edge_alpha,
+        lambda_normal_edge=lambda_normal_edge,
         tol=tol,
         maxiter=maxiter,
         clip_min=clip_min,
@@ -284,9 +302,11 @@ def benchmark_initialization(
                     known_mask,
                     hole_mask,
                     guide_gray,
+                    n_guide,
                     lambda_grad=lambda_grad,
                     lambda_smooth=lambda_smooth,
                     edge_alpha=edge_alpha,
+                    lambda_normal_edge=lambda_normal_edge,
                     tol=tol,
                     maxiter=maxiter,
                     clip_min=clip_min,
