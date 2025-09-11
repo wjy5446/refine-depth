@@ -16,20 +16,6 @@ def _make_rays(K: np.ndarray, H: int, W: int) -> np.ndarray:
     return rays.astype(np.float32)
 
 
-def _edge_weights_from_gray(guide_gray: np.ndarray | None, edge_alpha: float, H: int, W: int):
-    """엣지 가중치 w_edge = exp(-alpha * |ΔI|). guide_gray=None이면 1 반환."""
-    if guide_gray is None:
-        one_h = np.ones((H, W-1), np.float32)
-        one_v = np.ones((H-1, W), np.float32)
-        return one_h, one_v
-    g = guide_gray.astype(np.float32, copy=False)
-    if g.max() > 1.5:  # 0~255 → [0,1]
-        g = g / 255.0
-    diff_h = np.abs(g[:, 1:] - g[:, :-1]).astype(np.float32)
-    diff_v = np.abs(g[1:, :] - g[:-1, :]).astype(np.float32)
-    return np.exp(-edge_alpha * diff_h), np.exp(-edge_alpha * diff_v)
-
-
 # ---------- Main (vectorized, all-pixel variables) ----------
 
 def refine_depth_normal_alignment(
@@ -37,7 +23,7 @@ def refine_depth_normal_alignment(
     depth_in: np.ndarray,
     known_mask: np.ndarray,
     hole_mask: np.ndarray,
-    guide_gray: np.ndarray | None,
+    guide_gray: np.ndarray | None,  # 시그니처 유지 (미사용)
     n_guide: np.ndarray | None,
     K: np.ndarray | None,
     lambda_normal: float = 3.0,
@@ -46,23 +32,23 @@ def refine_depth_normal_alignment(
     lambda_screen: float = 1e-3,
     lambda_n: float | None = 0.5,
     tau_n: float | None = 0.95,
-    edge_alpha: float = 6.0,
+    edge_alpha: float = 6.0,        # 시그니처 유지 (미사용)
     tol: float = 1e-4,
     maxiter: int = 200,
     solver: str = "lsmr",
 ) -> np.ndarray:
     """
-    (N) 노멀 정합: 엣지 가중 미사용
-    (S) 스무딩:    엣지 가중 사용 (이웃 차분)
-    (D) 데이터:    엣지 가중 사용 (known-이웃 앵커)
-    (R) 스크린:    z ≈ z_init (주로 hole 안정화)
-    (K) Keep-known: mask가 아닌(known) 픽셀은 z ≈ depth_in으로 강하게 고정 (per-pixel)
+    Discontinuity(깊이 경계) 기반 게이팅:
+      - (S) 스무딩: 경계 쌍 제외
+      - (D) 데이터: 모든 픽셀에 대해 4방향 중 비-경계 이웃 가운데 |Δz_ref| 최소 하나로 스칼라 앵커
+      - (N) 노멀: 경계 쌍 제외
+    guide_gray/edge_alpha는 사용하지 않음(시그니처만 유지).
     """
     H, W = depth_in.shape
     depth_init = depth_init.astype(np.float32, copy=False)
     depth_in   = depth_in.astype(np.float32,   copy=False)
 
-    # 변수 인덱스: 전 픽셀을 변수로 사용
+    # 변수 인덱스: 전 픽셀 변수
     idx_map = np.arange(H * W, dtype=np.int32).reshape(H, W)
     N = H * W
 
@@ -87,16 +73,40 @@ def refine_depth_normal_alignment(
     dot = np.sum(n * rays, axis=2)
     n[dot > 0] *= -1.0
 
-    # Ray differences, edge weights
+    # Ray differences
     rx = rays[:, 1:, :] - rays[:, :-1, :]
     ry = rays[1:, :, :] - rays[:-1, :, :]
-    w_e_h, w_e_v = _edge_weights_from_gray(guide_gray, edge_alpha, H, W)
+
+    # ---- Discontinuity detection (depth-based) ----
+    # 기준 깊이: known → depth_in, else → depth_init
+    z_ref = np.where(known_mask, depth_in, depth_init).astype(np.float32)
+
+    dz_h = np.abs(z_ref[:, 1:] - z_ref[:, :-1])   # (H, W-1)
+    dz_v = np.abs(z_ref[1:, :] - z_ref[:-1, :])   # (H-1, W)
+
+    # 상대/절대 임계
+    tau_discon_rel = 0.05
+    tau_discon_abs = None  # 예: 0.02 등 절대 임계. None이면 미사용.
+
+    thr_h_rel = tau_discon_rel * np.maximum(z_ref[:, 1:], z_ref[:, :-1])
+    thr_v_rel = tau_discon_rel * np.maximum(z_ref[1:, :], z_ref[:-1, :])
+    thr_h = thr_h_rel if tau_discon_abs is None else np.maximum(thr_h_rel, tau_discon_abs)
+    thr_v = thr_v_rel if tau_discon_abs is None else np.maximum(thr_v_rel, tau_discon_abs)
+
+    disc_h = dz_h > thr_h            # (H, W-1)  between (i,j) and (i,j+1)
+    disc_v = dz_v > thr_v            # (H-1, W)  between (i,j) and (i+1,j)
+
+    # ---- Align discontinuities to current-pixel viewpoints (L/R/U/D), all (H,W) ----
+    discL = np.zeros((H, W), dtype=bool); discL[:, 1:]  = disc_h
+    discR = np.zeros((H, W), dtype=bool); discR[:, :-1] = disc_h
+    discU = np.zeros((H, W), dtype=bool); discU[1:, :]  = disc_v
+    discD = np.zeros((H, W), dtype=bool); discD[:-1, :] = disc_v
 
     # ----- 빅 COO/벡터 버퍼 -----
-    data_buf = []
-    row_buf  = []
-    col_buf  = []
-    b_buf    = []
+    data_buf: list[np.ndarray] = []
+    row_buf:  list[np.ndarray] = []
+    col_buf:  list[np.ndarray] = []
+    b_buf:    list[np.ndarray] = []
     row_ofs  = 0
 
     def _append_block(vals, ridx, cidx, rhs):
@@ -109,26 +119,28 @@ def refine_depth_normal_alignment(
         b_buf.append(rhs.astype(np.float32, copy=False))
         row_ofs += rhs.size
 
-    # ===== (N) 노멀 정합: 수평/수직 (엣지 가중 X) =====
+    # ===== (N) 노멀 정합: discontinuity 쌍 제외 =====
     if lambda_normal > 0:
         lamN = np.sqrt(lambda_normal)
 
-        # Horizontal pairs (p: left, q: right)
+        # Horizontal (p: left, q: right)
         n_p = n[:, :-1, :].reshape(-1, 3)
-        n_q = n[:,  1:, :].reshape(-1, 3)
         r_p = rays[:, :-1, :].reshape(-1, 3)
         rdx = rx.reshape(-1, 3)
         p_idx = idx_map[:, :-1].reshape(-1)
         q_idx = idx_map[:,  1:].reshape(-1)
 
-        base_w = lamN * np.ones(p_idx.size, np.float32)
+        base_w_h = lamN * np.ones(p_idx.size, np.float32)
         if (lambda_n is not None) and (tau_n is not None):
+            n_q = n[:, 1:, :].reshape(-1, 3)
             sim = np.abs(np.sum(n_p * n_q, axis=1)).astype(np.float32)
             valid_h = sim >= float(tau_n)
-            ww = base_w * np.sqrt(np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32))
+            ww_h = base_w_h * np.sqrt(np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32))
         else:
             valid_h = np.ones(p_idx.size, dtype=bool)
-            ww = base_w
+            ww_h = base_w_h
+
+        ok_h = (~disc_h).reshape(-1) & valid_h
 
         a = np.sum(n_p * r_p, axis=1).astype(np.float32)
         b = np.sum(n_p * rdx, axis=1).astype(np.float32)
@@ -137,32 +149,33 @@ def refine_depth_normal_alignment(
         den = np.sqrt(c_p * c_p + c_q * c_q) + 1e-6
         c_p /= den; c_q /= den
 
-        ok = valid_h
-        if ok.any():
-            Kk = int(np.count_nonzero(ok))
+        if np.any(ok_h):
+            Kk = int(np.count_nonzero(ok_h))
             rr = np.arange(Kk, dtype=np.int32)
-            vals = np.concatenate([ww[ok]*c_p[ok], ww[ok]*c_q[ok]])
+            vals = np.concatenate([ww_h[ok_h]*c_p[ok_h], ww_h[ok_h]*c_q[ok_h]])
             ridx = np.concatenate([rr, rr])
-            cidx = np.concatenate([p_idx[ok], q_idx[ok]])
+            cidx = np.concatenate([p_idx[ok_h], q_idx[ok_h]])
             rhs  = np.zeros(Kk, np.float32)
             _append_block(vals, ridx, cidx, rhs)
 
-        # Vertical pairs (p: up, q: down)
+        # Vertical (p: up, q: down)
         n_p = n[:-1, :, :].reshape(-1, 3)
-        n_q = n[ 1:, :, :].reshape(-1, 3)
         r_p = rays[:-1, :, :].reshape(-1, 3)
         rdy = ry.reshape(-1, 3)
         p_idx = idx_map[:-1, :].reshape(-1)
         q_idx = idx_map[ 1:, :].reshape(-1)
 
-        base_w = lamN * np.ones(p_idx.size, np.float32)
+        base_w_v = lamN * np.ones(p_idx.size, np.float32)
         if (lambda_n is not None) and (tau_n is not None):
+            n_q = n[1:, :, :].reshape(-1, 3)
             sim = np.abs(np.sum(n_p * n_q, axis=1)).astype(np.float32)
             valid_v = sim >= float(tau_n)
-            ww = base_w * np.sqrt(np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32))
+            ww_v = base_w_v * np.sqrt(np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32))
         else:
             valid_v = np.ones(p_idx.size, dtype=bool)
-            ww = base_w
+            ww_v = base_w_v
+
+        ok_v = (~disc_v).reshape(-1) & valid_v
 
         a = np.sum(n_p * r_p, axis=1).astype(np.float32)
         b = np.sum(n_p * rdy, axis=1).astype(np.float32)
@@ -171,89 +184,106 @@ def refine_depth_normal_alignment(
         den = np.sqrt(c_p * c_p + c_q * c_q) + 1e-6
         c_p /= den; c_q /= den
 
-        ok = valid_v
-        if ok.any():
-            Kk = int(np.count_nonzero(ok))
+        if np.any(ok_v):
+            Kk = int(np.count_nonzero(ok_v))
             rr = np.arange(Kk, dtype=np.int32)
-            vals = np.concatenate([ww[ok]*c_p[ok], ww[ok]*c_q[ok]])
+            vals = np.concatenate([ww_v[ok_v]*c_p[ok_v], ww_v[ok_v]*c_q[ok_v]])
             ridx = np.concatenate([rr, rr])
-            cidx = np.concatenate([p_idx[ok], q_idx[ok]])
+            cidx = np.concatenate([p_idx[ok_v], q_idx[ok_v]])
             rhs  = np.zeros(Kk, np.float32)
             _append_block(vals, ridx, cidx, rhs)
 
-    # ===== (S) 스무딩: 전 픽셀 이웃, 엣지 가중 =====
+    # ===== (S) 스무딩: 경계 쌍 제외 (균등 가중) =====
     if lambda_smooth > 0:
         lamS = np.sqrt(lambda_smooth)
 
-        # Horizontal all-variable pairs
-        ww = lamS * np.sqrt(w_e_h.astype(np.float32).reshape(-1))
-        p_idx = idx_map[:, :-1].reshape(-1)
-        q_idx = idx_map[:,  1:].reshape(-1)
-        Kk = p_idx.size
-        if Kk > 0:
+        # Horizontal
+        mask_h = ~disc_h
+        if np.any(mask_h):
+            p_idx = idx_map[:, :-1][mask_h].reshape(-1)
+            q_idx = idx_map[:,  1:][mask_h].reshape(-1)
+            Kk = p_idx.size
             rr = np.arange(Kk, dtype=np.int32)
+            ww = lamS * np.ones(Kk, np.float32)
             vals = np.concatenate([ww, -ww])
             ridx = np.concatenate([rr, rr])
             cidx = np.concatenate([p_idx, q_idx])
             rhs  = np.zeros(Kk, np.float32)
             _append_block(vals, ridx, cidx, rhs)
 
-        # Vertical all-variable pairs
-        ww = lamS * np.sqrt(w_e_v.astype(np.float32).reshape(-1))
-        p_idx = idx_map[:-1, :].reshape(-1)
-        q_idx = idx_map[ 1:, :].reshape(-1)
-        Kk = p_idx.size
-        if Kk > 0:
+        # Vertical
+        mask_v = ~disc_v
+        if np.any(mask_v):
+            p_idx = idx_map[:-1, :][mask_v].reshape(-1)
+            q_idx = idx_map[ 1:, :][mask_v].reshape(-1)
+            Kk = p_idx.size
             rr = np.arange(Kk, dtype=np.int32)
+            ww = lamS * np.ones(Kk, np.float32)
             vals = np.concatenate([ww, -ww])
             ridx = np.concatenate([rr, rr])
             cidx = np.concatenate([p_idx, q_idx])
             rhs  = np.zeros(Kk, np.float32)
             _append_block(vals, ridx, cidx, rhs)
 
-    # ===== (D) 데이터 앵커: known-이웃 경계 (엣지 가중) =====
+         # ===== (D) 데이터 앵커: 경계 픽셀 & hole 픽셀에만 적용 (one-hot, L→R→U→D) =====
     if lambda_data > 0:
         lamD = np.sqrt(lambda_data)
 
-        # Horizontal: p known, q variable → q를 z_a로 끌어줌
-        mask = known_mask[:, :-1] & (~known_mask[:, 1:])
-        if mask.any():
-            q_idx = idx_map[:, 1:][mask]
-            z_a   = depth_in[:, :-1][mask]
-            ww    = lamD * np.sqrt(w_e_h[mask].astype(np.float32))
-            Kk = q_idx.size
-            rr = np.arange(Kk, dtype=np.int32)
-            _append_block(ww, rr, q_idx, ww * z_a)
+        # 픽셀 단위 "경계 여부": 4방 중 하나라도 경계면 True
+        pix_disc = discL | discR | discU | discD
 
-        mask = (~known_mask[:, :-1]) & known_mask[:, 1:]
-        if mask.any():
-            p_idx = idx_map[:, :-1][mask]
-            z_a   = depth_in[:, 1:][mask]
-            ww    = lamD * np.sqrt(w_e_h[mask].astype(np.float32))
-            Kk = p_idx.size
-            rr = np.arange(Kk, dtype=np.int32)
-            _append_block(ww, rr, p_idx, ww * z_a)
+        # 비-경계 이웃만 후보로 허용 (경계 넘지 않기)
+        candL_ok = np.zeros((H, W), dtype=bool); candL_ok[:, 1:]  = ~discL[:, 1:]
+        candR_ok = np.zeros((H, W), dtype=bool); candR_ok[:, :-1] = ~discR[:, :-1]
+        candU_ok = np.zeros((H, W), dtype=bool); candU_ok[1:, :]  = ~discU[1:, :]
+        candD_ok = np.zeros((H, W), dtype=bool); candD_ok[:-1, :] = ~discD[:-1, :]
 
-        # Vertical
-        mask = known_mask[:-1, :] & (~known_mask[1:, :])
-        if mask.any():
-            q_idx = idx_map[1:, :][mask]
-            z_a   = depth_in[:-1, :][mask]
-            ww    = lamD * np.sqrt(w_e_v[mask].astype(np.float32))
-            Kk = q_idx.size
-            rr = np.arange(Kk, dtype=np.int32)
-            _append_block(ww, rr, q_idx, ww * z_a)
+        # |Δz_ref| (불가능 후보는 inf)
+        diffL = np.full((H, W), np.inf, np.float32); diffL[:, 1:]  = np.abs(z_ref[:, 1:] - z_ref[:, :-1]); diffL[~candL_ok] = np.inf
+        diffR = np.full((H, W), np.inf, np.float32); diffR[:, :-1] = np.abs(z_ref[:, :-1] - z_ref[:, 1:]); diffR[~candR_ok] = np.inf
+        diffU = np.full((H, W), np.inf, np.float32); diffU[1:, :]  = np.abs(z_ref[1:, :] - z_ref[:-1, :]); diffU[~candU_ok] = np.inf
+        diffD = np.full((H, W), np.inf, np.float32); diffD[:-1, :] = np.abs(z_ref[:-1, :] - z_ref[1:, :]); diffD[~candD_ok] = np.inf
 
-        mask = (~known_mask[:-1, :]) & known_mask[1:, :]
-        if mask.any():
-            p_idx = idx_map[:-1, :][mask]
-            z_a   = depth_in[1:, :][mask]
-            ww    = lamD * np.sqrt(w_e_v[mask].astype(np.float32))
-            Kk = p_idx.size
-            rr = np.arange(Kk, dtype=np.int32)
-            _append_block(ww, rr, p_idx, ww * z_a)
+        # 최소 후보와 one-hot 선택 (L→R→U→D 우선)
+        diffs = np.stack([diffL, diffR, diffU, diffD], axis=-1)  # HxWx4
+        min_diff = np.min(diffs, axis=-1)                        # HxW
+        allow = np.isfinite(min_diff) & hole_mask & pix_disc     # 경계&hole인 픽셀만 허용
 
-    # ===== (R) 스크린 앵커: hole에만 적용(기존 Stage-1 유지 유도) =====
+        onehot = np.zeros((H, W, 4), dtype=bool)
+        for d in (diffL, diffR, diffU, diffD):
+            sel = (d == min_diff) & allow & (~onehot.any(axis=-1))
+            # 해당 방향 인덱스에 True 세팅
+            if d is diffL:   onehot[..., 0] = sel
+            elif d is diffR: onehot[..., 1] = sel
+            elif d is diffU: onehot[..., 2] = sel
+            else:            onehot[..., 3] = sel
+
+        # 선택된 이웃의 인덱스 맵
+        idxL = np.full((H, W), -1, np.int32); idxL[:, 1:]  = idx_map[:, :-1]
+        idxR = np.full((H, W), -1, np.int32); idxR[:, :-1] = idx_map[:, 1:]
+        idxU = np.full((H, W), -1, np.int32); idxU[1:, :]  = idx_map[:-1, :]
+        idxD = np.full((H, W), -1, np.int32); idxD[:-1, :] = idx_map[1:, :]
+
+        nei_idx = (
+            idxL * onehot[..., 0] +
+            idxR * onehot[..., 1] +
+            idxU * onehot[..., 2] +
+            idxD * onehot[..., 3]
+        )
+
+        valid_anchor = onehot.any(axis=-1)  # 경계&hole에서 실제 하나가 선택된 픽셀
+        if np.any(valid_anchor):
+            var_ids = idx_map[valid_anchor]
+            nei_ids = nei_idx[valid_anchor]
+            z_a     = z_ref.reshape(-1)[nei_ids]
+
+            Kk = var_ids.size
+            rr = np.arange(Kk, dtype=np.int32)
+            ww = lamD * np.ones(Kk, np.float32)
+            _append_block(ww, rr, var_ids, ww * z_a)
+
+
+    # ===== (R) 스크린 앵커 =====
     if lambda_screen > 0:
         lamR = np.sqrt(lambda_screen)
         ids = idx_map[hole_mask]
@@ -263,17 +293,16 @@ def refine_depth_normal_alignment(
             ww = lamR * np.ones(Kk, np.float32)
             _append_block(ww, rr, ids, ww * depth_init[hole_mask])
 
-    # ===== (K) Keep-known: known 픽셀은 z ≈ depth_in으로 강하게 =====
-    # 내부 상수로 강도 설정(원하면 lambda_data 배수로 튜닝)
-    keep_scale = 100.0  # 필요시 5~50 범위에서 조절
+    # ===== (K) Keep-known =====
+    keep_scale = 30.0
     ids = idx_map[known_mask]
     if ids.size > 0:
         Kk = ids.size
         rr = np.arange(Kk, dtype=np.int32)
-        ww = np.sqrt(lambda_data * keep_scale) * np.ones(Kk, np.float32)
+        ww = np.sqrt(keep_scale) * np.ones(Kk, np.float32)
         _append_block(ww, rr, ids, ww * depth_in[known_mask])
 
-    # ===== 시스템 조립 =====
+    # ===== 시스템 조립/해 =====
     if len(data_buf) == 0:
         out = depth_init.copy()
         out[:] = depth_init
@@ -286,7 +315,6 @@ def refine_depth_normal_alignment(
 
     A = coo_matrix((data, (rows, cols)), shape=(rows.max()+1, N)).tocsr()
 
-    # ===== 선형해 =====
     if solver == "cg":
         AtA = (A.T @ A).tocsr()
         Atb = A.T @ b

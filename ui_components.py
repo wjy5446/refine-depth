@@ -214,13 +214,13 @@ def render_depth_completion_parameter_sidebar():
 
     lambda_refine_data = st.sidebar.slider(
         "λ_refine_data (경계 anchor 가중치)",
-        0.0, 2.0, 0.5, 0.01,
+        0.0, 2.0, 0.01, 0.01,
         help="정련 단계에서 경계 anchor에 대한 가중치"
     )
 
     lambda_refine_screen = st.sidebar.slider(
         "λ_refine_screen (초기화 anchor 가중치)",
-        1e-5, 1e-2, 1e-3, 1e-5,
+        0., 1e-2, 1e-3, 1e-5,
         format="%.0e",
         help="정련 단계에서 초기화 anchor에 대한 가중치"
     )
@@ -333,25 +333,6 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
                {'type': 'scatter3d'}, {'type': 'scatter3d'}]]
     )
 
-    # Original 데이터(Ground Truth) 기준으로 축 범위 계산
-    step = max(1, min(H, W) // 50)  # 최대 50x50 포인트로 샘플링
-    y_indices = np.arange(0, H, step)
-    x_indices = np.arange(0, W, step)
-    X_gt, Y_gt = np.meshgrid(x_indices, y_indices)
-    Z_gt = depth_gt[::step, ::step]
-
-    # Ground Truth의 유효한 포인트로 축 범위 설정
-    valid_mask_gt = np.isfinite(Z_gt) & (Z_gt > 0)
-    if np.sum(valid_mask_gt) > 0:
-        x_min, x_max = X_gt[valid_mask_gt].min(), X_gt[valid_mask_gt].max()
-        y_min, y_max = Y_gt[valid_mask_gt].min(), Y_gt[valid_mask_gt].max()
-        z_min, z_max = Z_gt[valid_mask_gt].min(), Z_gt[valid_mask_gt].max()
-    else:
-        # 유효한 포인트가 없는 경우 기본값 사용
-        x_min, x_max = 0, W
-        y_min, y_max = 0, H
-        z_min, z_max = 0, 3
-
     # 각 단계별 데이터 준비
     surfaces = [
         (depth_gt, "Ground Truth"),
@@ -363,6 +344,7 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
     for i, (depth, name) in enumerate(surfaces):
         try:
             # 샘플링된 좌표 생성
+            step = max(1, min(H, W) // 50)  # 최대 50x50 포인트로 샘플링
             y_indices = np.arange(0, H, step)
             x_indices = np.arange(0, W, step)
 
@@ -404,9 +386,7 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
                         colorscale='viridis',
                         opacity=0.8,
                         showscale=(i == 0),  # 첫 번째만 컬러바 표시
-                        colorbar=dict(title="Depth") if i == 0 else None,
-                        cmin=z_min,  # Ground Truth 기준 색상 범위 설정
-                        cmax=z_max
+                        colorbar=dict(title="Depth") if i == 0 else None
                     ),
                     name=name,
                     showlegend=False
@@ -433,21 +413,6 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
         height=600,
         showlegend=False
     )
-
-    # 모든 서브플롯에 동일한 축 범위 적용 (Ground Truth 기준)
-    for i in range(1, 5):
-        fig.update_scenes(
-            xaxis_title="X",
-            yaxis_title="Y",
-            zaxis_title="Depth",
-            xaxis=dict(range=[x_min, x_max]),
-            yaxis=dict(range=[y_min, y_max]),
-            zaxis=dict(range=[z_min, z_max]),
-            camera=dict(
-                eye=dict(x=1.5, y=1.5, z=1.5)
-            ),
-            row=1, col=i
-        )
 
     st.plotly_chart(fig, use_container_width=True)
 
