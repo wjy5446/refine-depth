@@ -68,7 +68,7 @@ def render_parameter_sidebar():
 
         col1, col2 = st.sidebar.columns(2)
         with col1:
-            noise_sigma = st.slider("노이즈 강도", 0.0, 1.0, 0.25, 0.05)
+            noise_sigma = st.slider("노이즈 강도", 0.0, .1, 0.01, 0.01)
         with col2:
             hole_mode = st.selectbox(
                 "홀 모드",
@@ -202,19 +202,19 @@ def render_depth_completion_parameter_sidebar():
     st.sidebar.subheader("🔧 정련 단계 파라미터")
     lambda_refine_normal = st.sidebar.slider(
         "λ_refine_normal (법선 정합 가중치)",
-        0.1, 10.0, 3.0, 0.1,
+        0.1, 10.0, 8.0, 0.1,
         help="정련 단계에서 법선 정합에 대한 가중치"
     )
 
     lambda_refine_smooth = st.sidebar.slider(
         "λ_refine_smooth (스무딩 가중치)",
-        0.01, 2.0, 0.2, 0.01,
+        0.0, 2.0, 0.01, 0.01,
         help="정련 단계에서 스무딩에 대한 가중치"
     )
 
     lambda_refine_data = st.sidebar.slider(
         "λ_refine_data (경계 anchor 가중치)",
-        0.01, 2.0, 0.5, 0.01,
+        0.0, 2.0, 0.5, 0.01,
         help="정련 단계에서 경계 anchor에 대한 가중치"
     )
 
@@ -229,7 +229,7 @@ def render_depth_completion_parameter_sidebar():
     st.sidebar.subheader("⚙️ 공통 파라미터")
     edge_alpha = st.sidebar.slider(
         "Edge Alpha (엣지 강도)",
-        1.0, 20.0, 6.0, 0.5,
+        1.0, 20.0, 8.0, 0.5,
         help="엣지 보존 강도. 높을수록 엣지를 더 잘 보존"
     )
 
@@ -333,6 +333,25 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
                {'type': 'scatter3d'}, {'type': 'scatter3d'}]]
     )
 
+    # Original 데이터(Ground Truth) 기준으로 축 범위 계산
+    step = max(1, min(H, W) // 50)  # 최대 50x50 포인트로 샘플링
+    y_indices = np.arange(0, H, step)
+    x_indices = np.arange(0, W, step)
+    X_gt, Y_gt = np.meshgrid(x_indices, y_indices)
+    Z_gt = depth_gt[::step, ::step]
+
+    # Ground Truth의 유효한 포인트로 축 범위 설정
+    valid_mask_gt = np.isfinite(Z_gt) & (Z_gt > 0)
+    if np.sum(valid_mask_gt) > 0:
+        x_min, x_max = X_gt[valid_mask_gt].min(), X_gt[valid_mask_gt].max()
+        y_min, y_max = Y_gt[valid_mask_gt].min(), Y_gt[valid_mask_gt].max()
+        z_min, z_max = Z_gt[valid_mask_gt].min(), Z_gt[valid_mask_gt].max()
+    else:
+        # 유효한 포인트가 없는 경우 기본값 사용
+        x_min, x_max = 0, W
+        y_min, y_max = 0, H
+        z_min, z_max = 0, 3
+
     # 각 단계별 데이터 준비
     surfaces = [
         (depth_gt, "Ground Truth"),
@@ -340,9 +359,6 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
         (depth_initialize, "Initialize"),
         (depth_refined, "Refined")
     ]
-
-    # 샘플링을 위한 스텝 크기 (성능을 위해)
-    step = max(1, min(H, W) // 50)  # 최대 50x50 포인트로 샘플링
 
     for i, (depth, name) in enumerate(surfaces):
         try:
@@ -376,16 +392,6 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
             y_flat = Y[valid_mask].flatten()
             z_flat = Z[valid_mask].flatten()
 
-            # 색상 매핑을 위한 정규화
-            if len(z_flat) > 0:
-                z_min, z_max = z_flat.min(), z_flat.max()
-                if z_max > z_min:
-                    z_normalized = (z_flat - z_min) / (z_max - z_min)
-                else:
-                    z_normalized = np.zeros_like(z_flat)
-            else:
-                z_normalized = np.array([])
-
             fig.add_trace(
                 go.Scatter3d(
                     x=x_flat,
@@ -399,8 +405,8 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
                         opacity=0.8,
                         showscale=(i == 0),  # 첫 번째만 컬러바 표시
                         colorbar=dict(title="Depth") if i == 0 else None,
-                        cmin=0,  # 색상 범위 설정
-                        cmax=3
+                        cmin=z_min,  # Ground Truth 기준 색상 범위 설정
+                        cmax=z_max
                     ),
                     name=name,
                     showlegend=False
@@ -428,12 +434,15 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
         showlegend=False
     )
 
-    # 각 서브플롯의 카메라 설정
+    # 모든 서브플롯에 동일한 축 범위 적용 (Ground Truth 기준)
     for i in range(1, 5):
         fig.update_scenes(
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Depth",
+            xaxis=dict(range=[x_min, x_max]),
+            yaxis=dict(range=[y_min, y_max]),
+            zaxis=dict(range=[z_min, z_max]),
             camera=dict(
                 eye=dict(x=1.5, y=1.5, z=1.5)
             ),
@@ -474,14 +483,107 @@ def render_performance_metrics(depth_gt, depth_in, depth_initialize, depth_refin
     with col1:
         st.metric("Initialize MAE", f"{init_mae:.4f}")
         st.metric("Refined MAE", f"{refine_mae:.4f}")
-        st.metric("개선도", f"{((init_mae - refine_mae) / init_mae * 100):.1f}%")
+        st.metric("개선도", f"{((init_mae - refine_mae) / init_mae * 100):.1f}%" if init_mae > 0 else "N/A")
 
     with col2:
         st.metric("Initialize RMSE", f"{init_rmse:.4f}")
         st.metric("Refined RMSE", f"{refine_rmse:.4f}")
-        st.metric("개선도", f"{((init_rmse - refine_rmse) / init_rmse * 100):.1f}%")
+        st.metric("개선도", f"{((init_rmse - refine_rmse) / init_rmse * 100):.1f}%" if init_rmse > 0 else "N/A")
 
     with col3:
         st.metric("Initialize 상관계수", f"{init_corr:.4f}")
         st.metric("Refined 상관계수", f"{refine_corr:.4f}")
-        st.metric("개선도", f"{((refine_corr - init_corr) / abs(init_corr) * 100):.1f}%")
+        st.metric("개선도", f"{((refine_corr - init_corr) / abs(init_corr) * 100):.1f}%" if abs(init_corr) > 0 else "N/A")
+
+
+def show_3d_point_cloud(depth_map):
+    """3D 포인트 클라우드 시각화"""
+    H, W = depth_map.shape
+    y, x = np.mgrid[0:H, 0:W]
+
+    # NaN 값 처리
+    valid_mask = ~np.isnan(depth_map)
+    x_valid = x[valid_mask]
+    y_valid = y[valid_mask]
+    z_valid = depth_map[valid_mask]
+
+    # 샘플링 (너무 많은 점이면)
+    if len(x_valid) > 5000:
+        indices = np.random.choice(len(x_valid), 5000, replace=False)
+        x_valid = x_valid[indices]
+        y_valid = y_valid[indices]
+        z_valid = z_valid[indices]
+
+    fig = go.Figure(data=[go.Scatter3d(
+        x=x_valid,
+        y=y_valid,
+        z=z_valid,
+        mode='markers',
+        marker=dict(
+            size=2,
+            color=z_valid,
+            colorscale='viridis',
+            opacity=0.8
+        )
+    )])
+
+    fig.update_layout(
+        title="3D Point Cloud",
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Depth"
+        )
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def show_3d_surface_mesh(depth_map):
+    """3D 서피스 메시 시각화"""
+    H, W = depth_map.shape
+    y, x = np.mgrid[0:H, 0:W]
+
+    # NaN 값을 0으로 대체
+    z = np.nan_to_num(depth_map, nan=0)
+
+    fig = go.Figure(data=[go.Surface(
+        x=x,
+        y=y,
+        z=z,
+        colorscale='viridis',
+        opacity=0.8
+    )])
+
+    fig.update_layout(
+        title="3D Surface Mesh",
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Depth"
+        )
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def show_3d_height_map(depth_map):
+    """3D 높이 맵 시각화"""
+    H, W = depth_map.shape
+
+    # NaN 값을 0으로 대체
+    z = np.nan_to_num(depth_map, nan=0)
+
+    fig = go.Figure(data=[go.Heatmap(
+        z=z,
+        colorscale='viridis',
+        showscale=True
+    )])
+
+    fig.update_layout(
+        title="3D Height Map",
+        xaxis_title="X",
+        yaxis_title="Y"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)

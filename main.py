@@ -20,6 +20,7 @@ def depth_completion(
     lambda_refine_smooth: float = 0.2,  # 정련 스무딩 가중치
     lambda_refine_data: float = 0.5,  # 정련 데이터 정합 가중치
     lambda_refine_screen: float = 1e-3,  # 정련 스크린 앵커 가중치
+    lambda_refine_keep: float | None = None,  # 정련 초기화 anchor 가중치
     # 공통 파라미터
     edge_alpha: float = 6.0,  # 엣지 강도
     tol: float = 1e-4,  # 수렴 기준
