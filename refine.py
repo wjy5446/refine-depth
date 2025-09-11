@@ -1,15 +1,15 @@
 ﻿import numpy as np
-from scipy.sparse import coo_matrix, vstack, diags
+from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import lsmr, cg
 
 
 # ---------- Utilities ----------
 
 def _make_rays(K: np.ndarray, H: int, W: int) -> np.ndarray:
-    """픽셀 광선 r_p = K^{-1} [x,y,1]^T (HxWx3), L2 정규화."""
+    """픽셀 광선 r_p = K^{-1}[x,y,1]^T (HxWx3), L2 정규화."""
     yy, xx = np.meshgrid(np.arange(H, dtype=np.float32),
                          np.arange(W, dtype=np.float32), indexing="ij")
-    pix = np.stack([xx, yy, np.ones_like(xx)], axis=-1)  # HxWx3
+    pix = np.stack([xx, yy, np.ones_like(xx)], axis=-1).astype(np.float32)
     Kinv = np.linalg.inv(K).astype(np.float32)
     rays = pix @ Kinv.T
     rays /= np.linalg.norm(rays, axis=2, keepdims=True).clip(1e-6, None)
@@ -17,293 +17,338 @@ def _make_rays(K: np.ndarray, H: int, W: int) -> np.ndarray:
 
 
 def _edge_weights_from_gray(guide_gray: np.ndarray | None, edge_alpha: float, H: int, W: int):
-    """
-    엣지 가중치 w_edge = exp(-alpha * |ΔI|).
-    guide_gray가 None이면 정확한 shape의 1을 반환.
-    """
+    """엣지 가중치 w_edge = exp(-alpha * |ΔI|). guide_gray=None이면 1 반환."""
     if guide_gray is None:
-        return np.ones((H, W-1), np.float32), np.ones((H-1, W), np.float32)
-    diff_h = np.abs(guide_gray[:, 1:] - guide_gray[:, :-1]).astype(np.float32)
-    diff_v = np.abs(guide_gray[1:, :] - guide_gray[:-1, :]).astype(np.float32)
-    w_e_h = np.exp(-edge_alpha * diff_h).astype(np.float32)  # H x (W-1)
-    w_e_v = np.exp(-edge_alpha * diff_v).astype(np.float32)  # (H-1) x W
-    return w_e_h, w_e_v
+        one_h = np.ones((H, W-1), np.float32)
+        one_v = np.ones((H-1, W), np.float32)
+        return one_h, one_v
+    g = guide_gray.astype(np.float32, copy=False)
+    if g.max() > 1.5:  # 0~255로 들어오는 경우 [0,1] 정규화
+        g = g / 255.0
+    diff_h = np.abs(g[:, 1:] - g[:, :-1]).astype(np.float32)
+    diff_v = np.abs(g[1:, :] - g[:-1, :]).astype(np.float32)
+    return np.exp(-edge_alpha * diff_h), np.exp(-edge_alpha * diff_v)
 
 
-def _push_row(rows_list, vals, row_idx, col_idx, nrow, N):
-    """COO 희소 행을 rows_list에 누적."""
-    if nrow <= 0:
-        return
-    rows_list.append(coo_matrix((vals, (row_idx, col_idx)), shape=(nrow, N)))
-
-
-# ---------- Main ----------
+# ---------- Main (vectorized) ----------
 
 def refine_depth_normal_alignment(
-    depth_init: np.ndarray,            # 초기 깊이 (Stage-1)
-    depth_in: np.ndarray,              # 원본 깊이 (경계 anchor)
-    known_mask: np.ndarray,            # True = known
-    hole_mask: np.ndarray,             # True = variable (미지수)
-    guide_gray: np.ndarray | None,     # 엣지 가이드 (스무딩·가중)
-    n_guide: np.ndarray | None,        # HxWx3 단위 법선
-    K: np.ndarray | None,              # intrinsics (3x3)
-    # Weights
-    lambda_normal: float = 3.0,        # (N) 법선 정합 강도
-    lambda_smooth: float = 0.2,        # (S) 스무딩
-    lambda_data: float = 1.0,          # (D) 경계 데이터  ※ 엣지 가중 적용
-    lambda_screen: float = 1e-3,       # (R) 스크린 앵커
-    # Normal similarity (optional)
-    lambda_n: float | None = 0.5,      # None이면 미사용
-    tau_n: float | None = 0.95,        # None이면 미사용
-    # Solver params
+    depth_init: np.ndarray,
+    depth_in: np.ndarray,
+    known_mask: np.ndarray,
+    hole_mask: np.ndarray,
+    guide_gray: np.ndarray | None,
+    n_guide: np.ndarray | None,
+    K: np.ndarray | None,
+    lambda_normal: float = 3.0,
+    lambda_smooth: float = 0.2,
+    lambda_data: float = 1.0,
+    lambda_screen: float = 1e-3,
+    lambda_n: float | None = 0.5,
+    tau_n: float | None = 0.95,
     edge_alpha: float = 6.0,
     tol: float = 1e-4,
     maxiter: int = 200,
-    solver: str = "lsmr",              # "lsmr" | "cg"
+    solver: str = "lsmr",
 ) -> np.ndarray:
     """
-    법선 정합(N): n^T ∂X/∂x = 0, n^T ∂X/∂y = 0 을 선형 LS로 최소화.
-    X_p = z_p r_p,  ∂X/∂x ≈ r_x z_p + r_p (z_q - z_p)  (q: 우/하 이웃)
+    (N) 노멀 정합: 엣지 가중 미사용
+    (S) 스무딩:    엣지 가중 사용
+    (D) 데이터:    엣지 가중 사용
+    (R) 스크린:    z ≈ z_init
     """
     H, W = depth_in.shape
-    assert depth_init.shape == (H, W)
-    assert known_mask.shape == (H, W) and hole_mask.shape == (H, W)
+    depth_init = depth_init.astype(np.float32, copy=False)
+    depth_in   = depth_in.astype(np.float32,   copy=False)
 
     # 변수 인덱스
     idx_map = -np.ones((H, W), dtype=np.int32)
     idx_map[hole_mask] = np.arange(int(hole_mask.sum()), dtype=np.int32)
     N = int(hole_mask.sum())
     if N == 0:
-        return depth_in.astype(np.float32)
+        return depth_in.copy()
 
-    # 기본 intrinsics / normals
+    # intrinsics / normals
     if K is None:
         K = np.array([[W, 0, W/2], [0, W, H/2], [0, 0, 1]], dtype=np.float32)
     if n_guide is None:
-        n_guide = np.zeros((H, W, 3), dtype=np.float32)
-        n_guide[:, :, 2] = 1.0
+        n = np.zeros((H, W, 3), dtype=np.float32)
+        n[..., 2] = 1.0
+    else:
+        n = n_guide.astype(np.float32, copy=False)
 
-    # Rays
-    rays = _make_rays(K, H, W)                      # HxWx3
-
-    # Normals + orientation fix (카메라를 향하도록 통일: n·r <= 0)
-    n = n_guide.astype(np.float32)
-    n /= np.linalg.norm(n, axis=2, keepdims=True).clip(1e-6, None)
+    rays = _make_rays(K, H, W)
+    # 노멀 방향 정규화 + 카메라를 향하도록 플립
+    n_norm = np.linalg.norm(n, axis=2, keepdims=True)
+    bad = (n_norm < 1e-6)
+    if bad.any():
+        n[bad[..., 0]] = np.array([0, 0, 1], dtype=np.float32)
+        n_norm = np.linalg.norm(n, axis=2, keepdims=True)
+    n = n / np.clip(n_norm, 1e-6, None)
     dot = np.sum(n * rays, axis=2)
     n[dot > 0] *= -1.0
-    n /= np.linalg.norm(n, axis=2, keepdims=True).clip(1e-6, None)
 
-    # Edge weights(스무딩/데이터용)
+    rx = rays[:, 1:, :] - rays[:, :-1, :]
+    ry = rays[1:, :, :] - rays[:-1, :, :]
     w_e_h, w_e_v = _edge_weights_from_gray(guide_gray, edge_alpha, H, W)
 
-    rows = []
-    rhs_all = []
+    # ----- 빅 COO/벡터 버퍼 -----
+    data_buf = []
+    row_buf  = []
+    col_buf  = []
+    b_buf    = []
+    row_ofs  = 0  # 누적 행 오프셋
 
-    # ---- Helper: 노멀 유사 가중/마스크 ----
-    def pair_weight_and_mask(nL, nR, base_w):
-        if (lambda_n is None) or (tau_n is None):
-            return base_w, np.ones(base_w.shape, bool)
-        sim = np.abs(np.sum(nL * nR, axis=1)).astype(np.float32)  # |cos|
-        valid = (sim >= tau_n)
-        w_n = np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32)
-        return base_w * np.sqrt(w_n), valid
+    def _append_block(vals, ridx, cidx, rhs):
+        nonlocal row_ofs
+        if vals.size == 0:
+            return
+        # ridx는 [0..k-1] local 인덱스라고 가정 → 누적 오프셋 더해 전역화
+        row_buf.append(ridx + row_ofs)
+        col_buf.append(cidx)
+        data_buf.append(vals)
+        b_buf.append(rhs.astype(np.float32, copy=False))
+        row_ofs += rhs.size
 
-    # ===== (N) Normal-Alignment =====
+    # ===== (N) 노멀 정합: 수평/수직 (엣지 가중 X) =====
     if lambda_normal > 0:
         lamN = np.sqrt(lambda_normal)
 
-        # Rays gradient (이웃 차분으로 근사)
-        rx = rays[:, 1:, :] - rays[:, :-1, :]   # H x (W-1) x 3
-        ry = rays[1:, :, :] - rays[:-1, :, :]   # (H-1) x W x 3
-
-        # ---------- Horizontal (left p -> right q) ----------
+        # --- Horizontal ---
         mask_any = (hole_mask[:, :-1] | hole_mask[:, 1:])
         if mask_any.any():
             n_p = n[:, :-1, :][mask_any]
             n_q = n[:,  1:, :][mask_any]
             r_p = rays[:, :-1, :][mask_any]
-            rx_p = rx[mask_any]
+            rdx = rx[mask_any]
             p_idx = idx_map[:, :-1][mask_any]
             q_idx = idx_map[:,  1:][mask_any]
+            z_known_q = depth_in[:, 1:][mask_any]
+            z_known_p = depth_in[:, :-1][mask_any]
 
-            base_w = lamN * np.sqrt(w_e_h[mask_any].astype(np.float32))  # 엣지 보존
-            ww, valid = pair_weight_and_mask(n_p, n_q, base_w)
+            base_w = lamN * np.ones(rdx.shape[0], np.float32)
+            if (lambda_n is not None) and (tau_n is not None):
+                sim = np.abs(np.sum(n_p * n_q, axis=1)).astype(np.float32)
+                valid = sim >= float(tau_n)
+                ww = base_w * np.sqrt(np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32))
+            else:
+                valid = np.ones(rdx.shape[0], dtype=bool)
+                ww = base_w
 
-            # residual: (n_p·r_p)*(z_q - z_p) + (n_p·rx_p)*z_p = 0
-            # => c_p*z_p + c_q*z_q = 0  where  c_p = (n_p·rx_p - n_p·r_p), c_q = (n_p·r_p)
-            a = np.sum(n_p * r_p, axis=1).astype(np.float32)   # n_p·r_p
-            b = np.sum(n_p * rx_p, axis=1).astype(np.float32)  # n_p·rx_p
-            c_p = b - a
-            c_q = a
-
-            # coefficient normalization (스케일 편향 제거)
+            a = np.sum(n_p * r_p, axis=1).astype(np.float32)
+            b = np.sum(n_p * rdx, axis=1).astype(np.float32)
+            a = np.nan_to_num(a); b = np.nan_to_num(b)
+            c_p = (b - a); c_q = a
             den = np.sqrt(c_p * c_p + c_q * c_q) + 1e-6
             c_p /= den; c_q /= den
 
+            # case 분기를 한 번에 벡터화
             # hole-hole
-            ok = valid & (p_idx >= 0) & (q_idx >= 0)
-            K = int(np.count_nonzero(ok))
+            ok_hh = valid & (p_idx >= 0) & (q_idx >= 0)
+            K = int(np.count_nonzero(ok_hh))
             if K > 0:
-                rr = np.arange(K)
-                _push_row(rows,
-                          np.concatenate([ww[ok]*c_p[ok], ww[ok]*c_q[ok]]),
-                          np.concatenate([rr, rr]),
-                          np.concatenate([p_idx[ok], q_idx[ok]]),
-                          K, N)
-                rhs_all.append(np.zeros(K, np.float32))
+                rr = np.arange(K, dtype=np.int32)
+                vals = np.concatenate([ww[ok_hh]*c_p[ok_hh], ww[ok_hh]*c_q[ok_hh]])
+                ridx = np.concatenate([rr, rr])
+                cidx = np.concatenate([p_idx[ok_hh], q_idx[ok_hh]])
+                rhs  = np.zeros(K, np.float32)
+                _append_block(vals, ridx, cidx, rhs)
 
-            # hole-known (q known)  —— RHS = ww * (c_q * z_a)
-            ok = valid & (p_idx >= 0) & (q_idx < 0)
-            K = int(np.count_nonzero(ok))
+            # hole-known (q known)
+            ok_hk = valid & (p_idx >= 0) & (q_idx < 0)
+            K = int(np.count_nonzero(ok_hk))
             if K > 0:
-                rr = np.arange(K)
-                _push_row(rows, ww[ok]*c_p[ok], rr, p_idx[ok], K, N)
-                rhs = ww[ok] * (-c_q[ok] * depth_in[:, 1:][mask_any][ok].astype(np.float32))
-                rhs_all.append(rhs)
+                rr = np.arange(K, dtype=np.int32)
+                vals = ww[ok_hk]*c_p[ok_hk]
+                ridx = rr
+                cidx = p_idx[ok_hk]
+                rhs  = -ww[ok_hk]*c_q[ok_hk]*z_known_q[ok_hk]
+                _append_block(vals, ridx, cidx, rhs)
 
-            # known-hole (p known) —— RHS = ww * (-c_p * z_a)
-            ok = valid & (p_idx < 0) & (q_idx >= 0)
-            K = int(np.count_nonzero(ok))
+            # known-hole (p known)
+            ok_kh = valid & (p_idx < 0) & (q_idx >= 0)
+            K = int(np.count_nonzero(ok_kh))
             if K > 0:
-                rr = np.arange(K)
-                _push_row(rows, ww[ok]*c_q[ok], rr, q_idx[ok], K, N)
-                rhs = ww[ok] * (-c_p[ok] * depth_in[:, :-1][mask_any][ok].astype(np.float32))
-                rhs_all.append(rhs)
+                rr = np.arange(K, dtype=np.int32)
+                vals = ww[ok_kh]*c_q[ok_kh]
+                ridx = rr
+                cidx = q_idx[ok_kh]
+                rhs  = -ww[ok_kh]*c_p[ok_kh]*z_known_p[ok_kh]
+                _append_block(vals, ridx, cidx, rhs)
 
-        # ---------- Vertical (up p -> down q) ----------
+        # --- Vertical ---
         mask_any = (hole_mask[:-1, :] | hole_mask[1:, :])
         if mask_any.any():
             n_p = n[:-1, :, :][mask_any]
             n_q = n[ 1:, :, :][mask_any]
             r_p = rays[:-1, :, :][mask_any]
-            ry_p = ry[mask_any]
+            rdy = ry[mask_any]
             p_idx = idx_map[:-1, :][mask_any]
             q_idx = idx_map[ 1:, :][mask_any]
+            z_known_q = depth_in[1:, :][mask_any]
+            z_known_p = depth_in[:-1, :][mask_any]
 
-            base_w = lamN * np.sqrt(w_e_v[mask_any].astype(np.float32))
-            ww, valid = pair_weight_and_mask(n_p, n_q, base_w)
+            base_w = lamN * np.ones(rdy.shape[0], np.float32)
+            if (lambda_n is not None) and (tau_n is not None):
+                sim = np.abs(np.sum(n_p * n_q, axis=1)).astype(np.float32)
+                valid = sim >= float(tau_n)
+                ww = base_w * np.sqrt(np.exp(-float(lambda_n) * (1.0 - sim)).astype(np.float32))
+            else:
+                valid = np.ones(rdy.shape[0], dtype=bool)
+                ww = base_w
 
-            a = np.sum(n_p * r_p, axis=1).astype(np.float32)   # n_p·r_p
-            b = np.sum(n_p * ry_p, axis=1).astype(np.float32)  # n_p·ry_p
-            c_p = b - a
-            c_q = a
-
+            a = np.sum(n_p * r_p, axis=1).astype(np.float32)
+            b = np.sum(n_p * rdy, axis=1).astype(np.float32)
+            a = np.nan_to_num(a); b = np.nan_to_num(b)
+            c_p = (b - a); c_q = a
             den = np.sqrt(c_p * c_p + c_q * c_q) + 1e-6
             c_p /= den; c_q /= den
 
-            ok = valid & (p_idx >= 0) & (q_idx >= 0)
-            K = int(np.count_nonzero(ok))
+            ok_hh = valid & (p_idx >= 0) & (q_idx >= 0)
+            K = int(np.count_nonzero(ok_hh))
             if K > 0:
-                rr = np.arange(K)
-                _push_row(rows,
-                          np.concatenate([ww[ok]*c_p[ok], ww[ok]*c_q[ok]]),
-                          np.concatenate([rr, rr]),
-                          np.concatenate([p_idx[ok], q_idx[ok]]),
-                          K, N)
-                rhs_all.append(np.zeros(K, np.float32))
+                rr = np.arange(K, dtype=np.int32)
+                vals = np.concatenate([ww[ok_hh]*c_p[ok_hh], ww[ok_hh]*c_q[ok_hh]])
+                ridx = np.concatenate([rr, rr])
+                cidx = np.concatenate([p_idx[ok_hh], q_idx[ok_hh]])
+                rhs  = np.zeros(K, np.float32)
+                _append_block(vals, ridx, cidx, rhs)
 
-            ok = valid & (p_idx >= 0) & (q_idx < 0)
-            K = int(np.count_nonzero(ok))
+            ok_hk = valid & (p_idx >= 0) & (q_idx < 0)
+            K = int(np.count_nonzero(ok_hk))
             if K > 0:
-                rr = np.arange(K)
-                _push_row(rows, ww[ok]*c_p[ok], rr, p_idx[ok], K, N)
-                rhs = ww[ok] * (-c_q[ok] * depth_in[1:, :][mask_any][ok].astype(np.float32))
-                rhs_all.append(rhs)
+                rr = np.arange(K, dtype=np.int32)
+                vals = ww[ok_hk]*c_p[ok_hk]
+                ridx = rr
+                cidx = p_idx[ok_hk]
+                rhs  = -ww[ok_hk]*c_q[ok_hk]*z_known_q[ok_hk]
+                _append_block(vals, ridx, cidx, rhs)
 
-            ok = valid & (p_idx < 0) & (q_idx >= 0)
-            K = int(np.count_nonzero(ok))
+            ok_kh = valid & (p_idx < 0) & (q_idx >= 0)
+            K = int(np.count_nonzero(ok_kh))
             if K > 0:
-                rr = np.arange(K)
-                _push_row(rows, ww[ok]*c_q[ok], rr, q_idx[ok], K, N)
-                rhs = ww[ok] * (-c_p[ok] * depth_in[:-1, :][mask_any][ok].astype(np.float32))
-                rhs_all.append(rhs)
+                rr = np.arange(K, dtype=np.int32)
+                vals = ww[ok_kh]*c_q[ok_kh]
+                ridx = rr
+                cidx = q_idx[ok_kh]
+                rhs  = -ww[ok_kh]*c_p[ok_kh]*z_known_p[ok_kh]
+                _append_block(vals, ridx, cidx, rhs)
 
-    # ===== (S) Smoothing: z_p - z_q = 0 (hole-hole만, 엣지 보존) =====
+    # ===== (S) 스무딩: 엣지 가중 사용 =====
     if lambda_smooth > 0:
         lamS = np.sqrt(lambda_smooth)
 
-        # Horizontal
+        # Horizontal hole-hole
         mask = hole_mask[:, :-1] & hole_mask[:, 1:]
         if mask.any():
             ww = lamS * np.sqrt(w_e_h[mask].astype(np.float32))
             p_idx = idx_map[:, :-1][mask]
             q_idx = idx_map[:,  1:][mask]
             K = p_idx.size
-            rr = np.arange(K)
-            _push_row(rows,
-                      np.concatenate([ww, -ww]),
-                      np.concatenate([rr, rr]),
-                      np.concatenate([p_idx, q_idx]),
-                      K, N)
-            rhs_all.append(np.zeros(K, np.float32))
+            rr = np.arange(K, dtype=np.int32)
+            vals = np.concatenate([ww, -ww])
+            ridx = np.concatenate([rr, rr])
+            cidx = np.concatenate([p_idx, q_idx])
+            rhs  = np.zeros(K, np.float32)
+            _append_block(vals, ridx, cidx, rhs)
 
-        # Vertical
+        # Vertical hole-hole
         mask = hole_mask[:-1, :] & hole_mask[1:, :]
         if mask.any():
             ww = lamS * np.sqrt(w_e_v[mask].astype(np.float32))
             p_idx = idx_map[:-1, :][mask]
             q_idx = idx_map[ 1:, :][mask]
             K = p_idx.size
-            rr = np.arange(K)
-            _push_row(rows,
-                      np.concatenate([ww, -ww]),
-                      np.concatenate([rr, rr]),
-                      np.concatenate([p_idx, q_idx]),
-                      K, N)
-            rhs_all.append(np.zeros(K, np.float32))
+            rr = np.arange(K, dtype=np.int32)
+            vals = np.concatenate([ww, -ww])
+            ridx = np.concatenate([rr, rr])
+            cidx = np.concatenate([p_idx, q_idx])
+            rhs  = np.zeros(K, np.float32)
+            _append_block(vals, ridx, cidx, rhs)
 
-    # ===== (D) Data: hole-경계 anchor  (엣지 가중 재적용) =====
+    # ===== (D) 데이터 앵커: 엣지 가중 사용 =====
     if lambda_data > 0:
         lamD = np.sqrt(lambda_data)
 
-        # Horizontal (p=hole, q=known)
+        # Horizontal 양방향
         mask = hole_mask[:, :-1] & known_mask[:, 1:]
         if mask.any():
             p_idx = idx_map[:, :-1][mask]
-            z_a  = depth_in[:, 1:][mask].astype(np.float32)
-            ww   = lamD * np.sqrt(w_e_h[mask].astype(np.float32))
-            K = p_idx.size; rr = np.arange(K)
-            _push_row(rows, ww, rr, p_idx, K, N); rhs_all.append(ww * z_a)
+            z_a   = depth_in[:, 1:][mask]
+            ww    = lamD * np.sqrt(w_e_h[mask].astype(np.float32))
+            K = p_idx.size
+            rr = np.arange(K, dtype=np.int32)
+            vals = ww
+            ridx = rr
+            cidx = p_idx
+            rhs  = ww * z_a
+            _append_block(vals, ridx, cidx, rhs)
 
-        # Horizontal (p=known, q=hole)
         mask = known_mask[:, :-1] & hole_mask[:, 1:]
         if mask.any():
             q_idx = idx_map[:, 1:][mask]
-            z_a  = depth_in[:, :-1][mask].astype(np.float32)
-            ww   = lamD * np.sqrt(w_e_h[mask].astype(np.float32))
-            K = q_idx.size; rr = np.arange(K)
-            _push_row(rows, ww, rr, q_idx, K, N); rhs_all.append(ww * z_a)
+            z_a   = depth_in[:, :-1][mask]
+            ww    = lamD * np.sqrt(w_e_h[mask].astype(np.float32))
+            K = q_idx.size
+            rr = np.arange(K, dtype=np.int32)
+            vals = ww
+            ridx = rr
+            cidx = q_idx
+            rhs  = ww * z_a
+            _append_block(vals, ridx, cidx, rhs)
 
-        # Vertical (p=hole, q=known)
+        # Vertical 양방향
         mask = hole_mask[:-1, :] & known_mask[1:, :]
         if mask.any():
             p_idx = idx_map[:-1, :][mask]
-            z_a  = depth_in[1:, :][mask].astype(np.float32)
-            ww   = lamD * np.sqrt(w_e_v[mask].astype(np.float32))
-            K = p_idx.size; rr = np.arange(K)
-            _push_row(rows, ww, rr, p_idx, K, N); rhs_all.append(ww * z_a)
+            z_a   = depth_in[1:, :][mask]
+            ww    = lamD * np.sqrt(w_e_v[mask].astype(np.float32))
+            K = p_idx.size
+            rr = np.arange(K, dtype=np.int32)
+            vals = ww
+            ridx = rr
+            cidx = p_idx
+            rhs  = ww * z_a
+            _append_block(vals, ridx, cidx, rhs)
 
-        # Vertical (p=known, q=hole)
         mask = known_mask[:-1, :] & hole_mask[1:, :]
         if mask.any():
             q_idx = idx_map[1:, :][mask]
-            z_a  = depth_in[:-1, :][mask].astype(np.float32)
-            ww   = lamD * np.sqrt(w_e_v[mask].astype(np.float32))
-            K = q_idx.size; rr = np.arange(K)
-            _push_row(rows, ww, rr, q_idx, K, N); rhs_all.append(ww * z_a)
+            z_a   = depth_in[:-1, :][mask]
+            ww    = lamD * np.sqrt(w_e_v[mask].astype(np.float32))
+            K = q_idx.size
+            rr = np.arange(K, dtype=np.int32)
+            vals = ww
+            ridx = rr
+            cidx = q_idx
+            rhs  = ww * z_a
+            _append_block(vals, ridx, cidx, rhs)
 
-    # ===== (R) Screen: z ≈ z_init (모든 hole) =====
+    # ===== (R) 스크린 앵커: 모든 hole =====
     if lambda_screen > 0:
         lamR = np.sqrt(lambda_screen)
         ww = lamR * np.ones(N, np.float32)
-        rr = np.arange(N)
-        _push_row(rows, ww, rr, np.arange(N), N, N)
-        rhs_all.append(ww * depth_init[hole_mask].astype(np.float32))
+        rr = np.arange(N, dtype=np.int32)
+        vals = ww
+        ridx = rr
+        cidx = np.arange(N, dtype=np.int32)
+        rhs  = ww * depth_init[hole_mask]
+        _append_block(vals, ridx, cidx, rhs)
 
-    # ===== Assemble & Solve =====
-    A = vstack(rows).tocsr()
-    b = np.concatenate(rhs_all).astype(np.float32)
+    # ===== 시스템 조립 =====
+    if len(data_buf) == 0:
+        out = depth_init.copy()
+        out[hole_mask] = depth_init[hole_mask]
+        return out
 
+    data = np.concatenate(data_buf)
+    rows = np.concatenate(row_buf)
+    cols = np.concatenate(col_buf)
+    b    = np.concatenate(b_buf).astype(np.float32)
+
+    A = coo_matrix((data, (rows, cols)), shape=(rows.max()+1, N)).tocsr()
+
+    # ===== 선형해 =====
     if solver == "cg":
         AtA = (A.T @ A).tocsr()
         Atb = A.T @ b
@@ -313,6 +358,6 @@ def refine_depth_normal_alignment(
         sol = lsmr(A, b, atol=tol, btol=tol, maxiter=maxiter)
         z_vec = sol[0]
 
-    out = depth_init.astype(np.float32).copy()
+    out = depth_init.copy()
     out[hole_mask] = z_vec.astype(np.float32)
     return out
