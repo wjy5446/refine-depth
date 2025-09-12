@@ -202,27 +202,39 @@ def render_depth_completion_parameter_sidebar():
     st.sidebar.subheader("🔧 정련 단계 파라미터")
     lambda_refine_normal = st.sidebar.slider(
         "λ_refine_normal (법선 정합 가중치)",
-        0.1, 10.0, 8.0, 0.1,
+        0.1, 10.0, 3.0, 0.1,
         help="정련 단계에서 법선 정합에 대한 가중치"
     )
 
     lambda_refine_smooth = st.sidebar.slider(
         "λ_refine_smooth (스무딩 가중치)",
-        0.0, 2.0, 0.01, 0.01,
+        0.0, 2.0, 0.2, 0.01,
         help="정련 단계에서 스무딩에 대한 가중치"
     )
 
-    lambda_refine_data = st.sidebar.slider(
-        "λ_refine_data (경계 anchor 가중치)",
-        0.0, 2.0, 0.01, 0.01,
-        help="정련 단계에서 경계 anchor에 대한 가중치"
+    lambda_refine_equal = st.sidebar.slider(
+        "λ_refine_equal (equal 가중치)",
+        0.0, 5.0, 1.0, 0.1,
+        help="정련 단계에서 equal constraint에 대한 가중치"
+    )
+
+    lambda_refine_plane = st.sidebar.slider(
+        "λ_refine_plane (plane 가중치)",
+        0.0, 5.0, 1.0, 0.1,
+        help="정련 단계에서 plane constraint에 대한 가중치"
     )
 
     lambda_refine_screen = st.sidebar.slider(
-        "λ_refine_screen (초기화 anchor 가중치)",
+        "λ_refine_screen (스크린 앵커 가중치)",
         0., 1e-2, 1e-3, 1e-5,
         format="%.0e",
-        help="정련 단계에서 초기화 anchor에 대한 가중치"
+        help="정련 단계에서 스크린 앵커에 대한 가중치"
+    )
+
+    lambda_refine_keep = st.sidebar.slider(
+        "λ_refine_keep (알려진 값 유지 가중치)",
+        0.0, 100.0, 30.0, 1.0,
+        help="정련 단계에서 알려진 값 유지에 대한 가중치"
     )
 
     # 공통 파라미터
@@ -277,8 +289,10 @@ def render_depth_completion_parameter_sidebar():
         # 정련 파라미터 (새로운 refine.py 기반)
         'lambda_refine_normal': lambda_refine_normal,
         'lambda_refine_smooth': lambda_refine_smooth,
-        'lambda_refine_data': lambda_refine_data,
+        'lambda_refine_equal': lambda_refine_equal,
+        'lambda_refine_plane': lambda_refine_plane,
         'lambda_refine_screen': lambda_refine_screen,
+        'lambda_refine_keep': lambda_refine_keep,
         # 공통 파라미터
         'edge_alpha': edge_alpha,
         'solver': solver,
@@ -323,6 +337,8 @@ def render_matplotlib_visualization(depth_gt, depth_in, depth_initialize, depth_
 
 def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_refined):
     """Plotly를 사용한 3D 인터랙티브 시각화를 렌더링합니다."""
+    from refine import detect_discontinuities
+
     H, W = depth_gt.shape
 
     # 서브플롯 생성 (1행 4열)
@@ -332,6 +348,9 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
         specs=[[{'type': 'scatter3d'}, {'type': 'scatter3d'},
                {'type': 'scatter3d'}, {'type': 'scatter3d'}]]
     )
+
+    # depth_initialize에서 불연속 맵 계산 (한 번만)
+    disc_map_initialize = detect_discontinuities(depth_initialize, tau_rel=0.05)
 
     # 각 단계별 데이터 준비
     surfaces = [
@@ -374,29 +393,118 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
             y_flat = Y[valid_mask].flatten()
             z_flat = Z[valid_mask].flatten()
 
-            fig.add_trace(
-                go.Scatter3d(
-                    x=x_flat,
-                    y=y_flat,
-                    z=z_flat,
-                    mode='markers',
-                    marker=dict(
-                        size=2,
-                        color=z_flat,
-                        colorscale='viridis',
-                        opacity=0.8,
-                        showscale=(i == 0),  # 첫 번째만 컬러바 표시
-                        colorbar=dict(title="Depth") if i == 0 else None
+            # depth_refined에만 불연속 영역 정보 적용
+            if i == 3:  # depth_refined (4번째, 인덱스 3)
+                # depth_initialize에서 계산된 불연속 맵 사용
+                disc_sampled = disc_map_initialize[::step, ::step]
+                disc_flat = disc_sampled[valid_mask].flatten()
+
+                # 불연속 영역과 연속 영역을 분리
+                disc_mask = disc_flat.astype(bool)
+                cont_mask = ~disc_mask
+
+                # 연속 영역 (깊이값에 따른 색상)
+                if np.any(cont_mask):
+                    # 연속 영역용 호버 텍스트 생성
+                    cont_hover_texts = []
+                    for j in range(np.sum(cont_mask)):
+                        idx = np.where(cont_mask)[0][j]
+                        x_coord = int(x_flat[idx])
+                        y_coord = int(y_flat[idx])
+                        z_val = z_flat[idx]
+                        is_discontinuous = disc_flat[idx]
+
+                        hover_text = (
+                            f"<b>{name}</b><br>"
+                            f"좌표: ({x_coord}, {y_coord})<br>"
+                            f"깊이값: {z_val:.3f}<br>"
+                        )
+                        cont_hover_texts.append(hover_text)
+
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=x_flat[cont_mask],
+                            y=y_flat[cont_mask],
+                            z=z_flat[cont_mask],
+                            mode='markers',
+                            marker=dict(
+                                size=2,
+                                color=z_flat[cont_mask],
+                                colorscale='viridis',
+                                opacity=0.8,
+                                showscale=True,
+                                colorbar=dict(title="Depth")
+                            ),
+                            name=f"{name} (연속)",
+                            showlegend=False,
+                            customdata=cont_hover_texts,
+                            hovertemplate="%{customdata}<extra></extra>"
+                        ),
+                        row=1, col=i+1
+                    )
+
+                # 불연속 영역 (빨간색)
+                if np.any(disc_mask):
+                    # 불연속 영역용 호버 텍스트 생성
+                    disc_hover_texts = []
+                    for j in range(np.sum(disc_mask)):
+                        idx = np.where(disc_mask)[0][j]
+                        x_coord = int(x_flat[idx])
+                        y_coord = int(y_flat[idx])
+                        z_val = z_flat[idx]
+
+                        hover_text = (
+                            f"<b>{name}</b><br>"
+                            f"좌표: ({x_coord}, {y_coord})<br>"
+                            f"깊이값: {z_val:.3f}<br>"
+                        )
+                        disc_hover_texts.append(hover_text)
+
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=x_flat[disc_mask],
+                            y=y_flat[disc_mask],
+                            z=z_flat[disc_mask],
+                            mode='markers',
+                            marker=dict(
+                                size=2,  # 불연속 영역은 조금 더 크게
+                                color='red',
+                                opacity=0.9
+                            ),
+                            name=f"{name} (불연속)",
+                            showlegend=False,
+                            customdata=disc_hover_texts,
+                            hovertemplate="%{customdata}<extra></extra>"
+                        ),
+                        row=1, col=i+1
+                    )
+            else:
+                # 나머지 단계들은 기본 시각화
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=x_flat,
+                        y=y_flat,
+                        z=z_flat,
+                        mode='markers',
+                        marker=dict(
+                            size=2,
+                            color=z_flat,
+                            colorscale='viridis',
+                            opacity=0.8,
+                            showscale=(i == 0),  # 첫 번째만 컬러바 표시
+                            colorbar=dict(title="Depth") if i == 0 else None
+                        ),
+                        name=name,
+                        showlegend=False
                     ),
-                    name=name,
-                    showlegend=False
-                ),
-                row=1, col=i+1
-            )
+                    row=1, col=i+1
+                )
 
         except Exception as e:
             # 오류 발생 시 빈 trace 추가
             print(f"Error processing {name}: {e}")
+            import traceback
+            traceback.print_exc()
             fig.add_trace(
                 go.Scatter3d(
                     x=[], y=[], z=[],
@@ -409,7 +517,7 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
 
     # 레이아웃 업데이트
     fig.update_layout(
-        title="3D Point Cloud 깊이 맵 비교",
+        title="3D Point Cloud 깊이 맵 비교 (Refined에서 불연속 영역 강조, 호버로 상세 정보 확인)",
         height=600,
         showlegend=False
     )

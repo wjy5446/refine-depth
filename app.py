@@ -150,7 +150,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
             progress_bar.progress(50)
 
             start_time = time.time()
-            depth_initialize, depth_refined, timing_info = depth_completion(
+            depth_initialize, depth_refined, discontinue_maps, timing_info = depth_completion(
                 depth_in=st.session_state.depth_in,
                 refine_roi=st.session_state.refine_roi,
                 valid_mask=st.session_state.valid_mask,
@@ -164,7 +164,8 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                 # 정련 파라미터 (새로운 refine.py 기반)
                 lambda_refine_normal=depth_completion_params['lambda_refine_normal'],
                 lambda_refine_smooth=depth_completion_params['lambda_refine_smooth'],
-                lambda_refine_data=depth_completion_params['lambda_refine_data'],
+                lambda_refine_equal=depth_completion_params['lambda_refine_equal'],
+                lambda_refine_plane=depth_completion_params['lambda_refine_plane'],
                 lambda_refine_screen=depth_completion_params['lambda_refine_screen'],
                 # 공통 파라미터
                 edge_alpha=depth_completion_params['edge_alpha'],
@@ -186,6 +187,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
             # 세션 상태에 결과 저장
             st.session_state.depth_initialize = depth_initialize
             st.session_state.depth_refined = depth_refined
+            st.session_state.discontinue_maps = discontinue_maps
             st.session_state.results_ready = True
             st.session_state.timing_info = timing_info
 
@@ -240,18 +242,18 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                     with st.spinner("정련 실행 중..."):
                         start_time = time.time()
                         depth_refined = refine_depth_normal_alignment(
-                            depth_init=st.session_state.depth_initialize,
-                            depth_in=st.session_state.depth_in,
+                            depth_in=st.session_state.depth_initialize,
                             known_mask=st.session_state.valid_mask,
                             hole_mask=st.session_state.hole_mask,
-                            guide_gray=st.session_state.guide_gray,
                             n_guide=st.session_state.normals_gt,
                             K=st.session_state.K,
+                            discontinuity_maps=None,  # 자동 감지
                             lambda_normal=depth_completion_params['lambda_refine_normal'],
                             lambda_smooth=depth_completion_params['lambda_refine_smooth'],
-                            lambda_data=depth_completion_params['lambda_refine_data'],
+                            lambda_equal=depth_completion_params.get('lambda_refine_equal', 1.0),
+                            lambda_plane=depth_completion_params.get('lambda_refine_plane', 1.0),
                             lambda_screen=depth_completion_params['lambda_refine_screen'],
-                            edge_alpha=depth_completion_params['edge_alpha'],
+                            lambda_keep=depth_completion_params.get('lambda_refine_keep', 30.0),
                             tol=depth_completion_params['tol'],
                             maxiter=depth_completion_params['maxiter'],
                             solver=depth_completion_params['solver']
@@ -316,7 +318,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
 
                     # 깊이 완성 실행
                     start_time = time.time()
-                    depth_initialize, depth_refined, timing_info = depth_completion(
+                    depth_initialize, depth_refined, discontinue_maps, timing_info = depth_completion(
                         depth_in=st.session_state.depth_in,
                         refine_roi=st.session_state.refine_roi,
                         valid_mask=st.session_state.valid_mask,
@@ -328,7 +330,8 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                         lambda_init_normal_edge=test_params['lambda_init_normal_edge'],
                         lambda_refine_normal=test_params['lambda_refine_normal'],
                         lambda_refine_smooth=test_params['lambda_refine_smooth'],
-                        lambda_refine_data=test_params['lambda_refine_data'],
+                        lambda_refine_equal=test_params['lambda_refine_equal'],
+                        lambda_refine_plane=test_params['lambda_refine_plane'],
                         lambda_refine_screen=test_params['lambda_refine_screen'],
                         edge_alpha=test_params['edge_alpha'],
                         solver=test_params['solver'],
@@ -398,7 +401,7 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
     if 'results_ready' in st.session_state and st.session_state.results_ready:
 
         # 탭으로 구분
-        tab1, tab2, tab3 = st.tabs(["🔍 단계별 비교", "📈 성능 메트릭", "🌐 3D 시각화"])
+        tab1, tab2, tab3, tab4 = st.tabs(["🔍 단계별 비교", "📈 성능 메트릭", "🌐 3D 시각화", "🔍 불연속성 분석"])
 
         with tab1:
             st.subheader("단계별 결과 비교")
@@ -449,6 +452,55 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                 show_3d_surface_mesh(st.session_state.depth_refined)
             else:  # Height Map
                 show_3d_height_map(st.session_state.depth_refined)
+
+        with tab4:
+            st.subheader("불연속성 분석")
+
+            if 'discontinue_maps' in st.session_state:
+                discontinue_maps = st.session_state.discontinue_maps
+
+                # 불연속성 맵 시각화
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.write("**불연속성 맵 (Discontinuity Map)**")
+                    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+                    im = ax.imshow(discontinue_maps, cmap='hot', interpolation='nearest')
+                    ax.set_title("감지된 경계/불연속성")
+                    ax.axis('off')
+                    plt.colorbar(im, ax=ax, label='불연속성 강도')
+                    st.pyplot(fig)
+
+                with col2:
+                    st.write("**통계 정보**")
+                    total_pixels = discontinue_maps.size
+                    discontinuity_pixels = np.sum(discontinue_maps)
+                    discontinuity_ratio = discontinuity_pixels / total_pixels * 100
+
+                    st.metric("총 픽셀 수", f"{total_pixels:,}")
+                    st.metric("불연속성 픽셀 수", f"{discontinuity_pixels:,}")
+                    st.metric("불연속성 비율", f"{discontinuity_ratio:.2f}%")
+
+                # 불연속성 맵과 깊이 맵 오버레이
+                st.write("**깊이 맵과 불연속성 오버레이**")
+                fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+                # 정련된 깊이 맵
+                im1 = axes[0].imshow(st.session_state.depth_refined, cmap='viridis')
+                axes[0].set_title("정련된 깊이 맵")
+                axes[0].axis('off')
+                plt.colorbar(im1, ax=axes[0], label='깊이')
+
+                # 오버레이
+                axes[1].imshow(st.session_state.depth_refined, cmap='viridis', alpha=0.7)
+                axes[1].imshow(discontinue_maps, cmap='Reds', alpha=0.5, interpolation='nearest')
+                axes[1].set_title("정련된 깊이 맵 + 불연속성 경계")
+                axes[1].axis('off')
+
+                plt.tight_layout()
+                st.pyplot(fig)
+            else:
+                st.info("불연속성 맵이 아직 생성되지 않았습니다. 먼저 파이프라인을 실행해주세요.")
 
     # 개별 단계 결과도 표시
     elif 'depth_initialize' in st.session_state or 'depth_refined' in st.session_state:

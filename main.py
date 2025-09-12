@@ -1,7 +1,7 @@
 import numpy as np
 import time
 from initialization import initial_guess_logpoisson_completion
-from refine import refine_depth_normal_alignment
+from refine import refine_depth_normal_alignment, detect_discontinuities
 
 
 def depth_completion(
@@ -18,7 +18,8 @@ def depth_completion(
     # 정련 단계 파라미터
     lambda_refine_normal: float = 3.0,  # 정련 공면 쌍항 가중치
     lambda_refine_smooth: float = 0.2,  # 정련 스무딩 가중치
-    lambda_refine_data: float = 0.5,  # 정련 데이터 정합 가중치
+    lambda_refine_equal: float = 1.0,  # 정련 equal 가중치
+    lambda_refine_plane: float = 1.0,  # 정련 plane 가중치
     lambda_refine_screen: float = 1e-3,  # 정련 스크린 앵커 가중치
     lambda_refine_keep: float | None = None,  # 정련 초기화 anchor 가중치
     # 공통 파라미터
@@ -28,7 +29,7 @@ def depth_completion(
     clip_min: float = 0.0,  # 최소값 클리핑
     clip_max: float | None = None,  # 최대값 클리핑
     solver: str = "lsmr",  # 솔버 ("lsmr" 또는 "cg")
-) -> tuple[np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     """
     깊이 완성 메인 파이프라인: 초기화 + 정련
 
@@ -42,13 +43,13 @@ def depth_completion(
         lambda_init_grad: 초기화 단계 그래디언트 가중치
         lambda_init_smooth: 초기화 단계 스무딩 가중치
         lambda_init_normal_edge: 초기화 단계 노멀 엣지 가중치
-        lambda_refine_plane: 정련 단계 공면 쌍항 가중치
-        lambda_refine_planeB: 정련 단계 공면 경계 단항 가중치
+        lambda_refine_normal: 정련 단계 공면 쌍항 가중치
         lambda_refine_smooth: 정련 단계 스무딩 가중치
         lambda_refine_data: 정련 단계 데이터 정합 가중치
+        lambda_refine_equal: 정련 단계 equal 가중치
+        lambda_refine_plane: 정련 단계 plane 가중치
         lambda_refine_screen: 정련 단계 스크린 앵커 가중치
-        lambda_refine_n: 정련 단계 노멀 유사도 가중치
-        lambda_refine_tau_n: 정련 단계 노멀 유사도 임계값
+        lambda_refine_keep: 정련 단계 초기화 anchor 가중치
         edge_alpha: 엣지 보존 강도
         tol: 수렴 판정 기준
         maxiter: 최대 반복 횟수
@@ -57,9 +58,10 @@ def depth_completion(
         solver: 선형 솔버 ("lsmr" 또는 "cg")
 
     Returns:
-        (depth_initialize, depth_refined, timing_info) 튜플
+        (depth_initialize, depth_refined, discontinue_maps, timing_info) 튜플
         depth_initialize: 초기화된 깊이 맵
         depth_refined: 정련된 깊이 맵
+        discontinue_maps: 불연속성 맵 (경계 감지 결과)
         timing_info: 각 단계별 처리 시간 정보 딕셔너리
     """
     # 시간 측정을 위한 딕셔너리 초기화
@@ -76,7 +78,7 @@ def depth_completion(
     hole_mask = refine_roi & (~known_mask)
 
     print(lambda_init_grad, lambda_init_smooth, lambda_init_normal_edge)
-    print(lambda_refine_normal, lambda_refine_smooth, lambda_refine_data, lambda_refine_screen)
+    print(lambda_refine_normal, lambda_refine_smooth, lambda_refine_equal, lambda_refine_plane, lambda_refine_screen)
     print(edge_alpha, tol, maxiter, clip_min, clip_max, solver)
 
     # Log-Poisson completion으로 초기화
@@ -99,21 +101,29 @@ def depth_completion(
     init_end_time = time.time()
     timing_info['init_time'] = init_end_time - init_start_time
 
+    discontinue_maps = detect_discontinuities(
+        depth_in=depth_initialize,
+        n=n_guide,
+        use_normals=True,
+        tau_n_cos=0.99,
+        normal_logic="or"
+    )
+
     # 정련 단계
     refine_start_time = time.time()
     depth_refined = refine_depth_normal_alignment(
-        depth_init=depth_initialize,              # Stage-1 출력
-        depth_in=depth_in,          # known 참조용
+        depth_in=depth_initialize,
         known_mask=known_mask,
         hole_mask=hole_mask,
-        guide_gray=guide_gray,      # 없으면 None
         n_guide=n_guide,            # 없으면 (P)(PB)는 자동 생략
         K=K,
+        discontinuity_maps=discontinue_maps,
         lambda_normal=lambda_refine_normal,
         lambda_smooth=lambda_refine_smooth,
-        lambda_data=lambda_refine_data,
+        lambda_equal=lambda_refine_equal,
+        lambda_plane=lambda_refine_plane,
         lambda_screen=lambda_refine_screen,
-        edge_alpha=edge_alpha,
+        lambda_keep=lambda_refine_keep if lambda_refine_keep is not None else 30.0,
         tol=tol,
         maxiter=maxiter,
         solver=solver
@@ -124,4 +134,4 @@ def depth_completion(
     total_end_time = time.time()
     timing_info['total_time'] = total_end_time - total_start_time
 
-    return depth_initialize, depth_refined, timing_info
+    return depth_initialize, depth_refined, discontinue_maps, timing_info
