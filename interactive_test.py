@@ -82,7 +82,7 @@ def create_synthetic_scene_with_holes(H=180, W=240, seed=0,
         add_vertical_stripes(step=28, width=5)
 
     refine_roi = hole_mask.copy()
-    valid_mask = np.isfinite(depth_noisy) & (depth_noisy > 0)
+    valid_mask = np.isfinite(depth_noisy.astype(np.float64)) & (depth_noisy > 0)
     depth_in = depth_noisy.copy()
     depth_in[hole_mask] = 0.0
     valid_mask[hole_mask] = False

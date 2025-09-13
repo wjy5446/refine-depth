@@ -96,7 +96,7 @@ else:
                 K = make_intrinsics(H, W)
 
                 # 필요한 파라미터들 생성
-                valid_mask = np.isfinite(depth_data) & (depth_data > 0)
+                valid_mask = np.isfinite(depth_data.astype(np.float64)) & (depth_data > 0)
                 valid_mask[hole_mask] = False
 
                 depth_in = depth_data.copy()
@@ -346,8 +346,12 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                     if 'depth_gt' in st.session_state:
                         gt = st.session_state.depth_gt
                         mae = np.mean(np.abs(depth_refined[hole_mask] - gt[hole_mask]))
-                        # 수정된 코드
-                        valid_mask = np.isfinite(depth_refined) & np.isfinite(gt) & hole_mask
+                        # 수정된 코드 - 더 안전한 유효성 검사
+                        valid_mask = (np.isfinite(depth_refined) &
+                                    np.isfinite(gt) &
+                                    hole_mask &
+                                    (depth_refined > 0) &
+                                    (gt > 0))
                         if np.sum(valid_mask) == 0:
                             rmse = 0
                         else:

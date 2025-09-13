@@ -69,11 +69,15 @@ def compute_normals_from_depth(depth, K):
     dz_dx = np.gradient(z, axis=1).astype(np.float32)
     dz_dy = np.gradient(z, axis=0).astype(np.float32)
 
-    nx = -dz_dx * np.float32(fx) / np.maximum(z, 1e-6)
-    ny = -dz_dy * np.float32(fy) / np.maximum(z, 1e-6)
+    # 더 안전한 0으로 나누기 방지
+    z_safe = np.maximum(np.abs(z), 1e-8)
+    nx = -dz_dx * np.float32(fx) / z_safe
+    ny = -dz_dy * np.float32(fy) / z_safe
     nz = np.ones_like(z, dtype=np.float32)
 
     norm = np.sqrt(nx**2 + ny**2 + nz**2).astype(np.float32)
+    # 0으로 나누기 방지
+    norm = np.maximum(norm, 1e-8)
     nx /= norm
     ny /= norm
     nz /= norm

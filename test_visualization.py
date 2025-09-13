@@ -131,7 +131,7 @@ def create_synthetic_scene_with_holes(H=180, W=240, seed=0,
         add_vertical_stripes(step=28, width=5)
 
     refine_roi = hole_mask.copy()  # 메꿀 영역
-    valid_mask = np.isfinite(depth_noisy) & (depth_noisy > 0)  # 관측 유효
+    valid_mask = np.isfinite(depth_noisy.astype(np.float64)) & (depth_noisy > 0)  # 관측 유효
     depth_in = depth_noisy.copy()
     depth_in[hole_mask] = 0.0  # 홀은 0/NaN으로 표시(유효 아님)
     valid_mask[hole_mask] = False
@@ -288,7 +288,7 @@ def visualize_depth_completion_1stage(depth_gt, depth_in, depth_initialize,
         ax = fig.add_subplot(4, 4, i + 1, projection='3d')
         H, W = depth.shape
         yy, xx = np.mgrid[0:H, 0:W]
-        valid = np.isfinite(depth) & (depth > 0)
+        valid = np.isfinite(depth.astype(np.float64)) & (depth > 0)
         if valid.any():
             ax.scatter(xx[valid], yy[valid], depth[valid], c=depth[valid],
                        cmap='viridis', s=1, alpha=0.6)

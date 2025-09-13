@@ -1,7 +1,8 @@
 import numpy as np
 import time
 from initialization import initial_guess_logpoisson_completion
-from refine import refine_depth_normal_alignment, detect_discontinuities
+from refine_fast import refine_depth_normal_alignment
+from refine import detect_discontinuities
 
 
 def depth_completion(
@@ -74,7 +75,7 @@ def depth_completion(
     total_start_time = time.time()
     depth_in = depth_in.astype(np.float32)
     refine_roi = refine_roi.astype(bool)
-    known_mask = (valid_mask.astype(bool) & np.isfinite(depth_in))
+    known_mask = (valid_mask.astype(bool) & np.isfinite(depth_in.astype(np.float64)))
     hole_mask = refine_roi & (~known_mask)
 
     print(lambda_init_grad, lambda_init_smooth, lambda_init_normal_edge)
@@ -124,9 +125,6 @@ def depth_completion(
         lambda_plane=lambda_refine_plane,
         lambda_screen=lambda_refine_screen,
         lambda_keep=lambda_refine_keep if lambda_refine_keep is not None else 30.0,
-        tol=tol,
-        maxiter=maxiter,
-        solver=solver
     )
     refine_end_time = time.time()
     timing_info['refine_time'] = refine_end_time - refine_start_time
