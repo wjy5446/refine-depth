@@ -26,11 +26,7 @@ def detect_discontinuities(
     tau_n_cos: float = 0.94,         # 법선 코사인 임계(≈20°)
     normal_logic: str = "or",        # 'or'|'and'|'only'
 ) -> np.ndarray:
-    """
-    단일 픽셀 불연속 맵 disc(H,W)을 만든다.
-    - 기본: 깊이 차 기반
-    - 옵션: 법선 급변도 결합
-    """
+    """단일 픽셀 불연속 맵 disc(H,W)을 만든다."""
     H, W = depth_in.shape
     # 깊이 기반 쌍 경계
     dz_h = np.abs(depth_in[:, 1:] - depth_in[:, :-1])
@@ -39,8 +35,8 @@ def detect_discontinuities(
     thr_v_rel = tau_rel * np.maximum(depth_in[1:, :], depth_in[:-1, :])
     thr_h = thr_h_rel if tau_abs is None else np.maximum(thr_h_rel, tau_abs)
     thr_v = thr_v_rel if tau_abs is None else np.maximum(thr_v_rel, tau_abs)
-    disc_h_d = dz_h > thr_h         # (H,W-1)
-    disc_v_d = dz_v > thr_v         # (H-1,W)
+    disc_h_d = dz_h > thr_h
+    disc_v_d = dz_v > thr_v
 
     # 법선 기반 쌍 경계(옵션)
     if use_normals and (n is not None):
@@ -54,7 +50,7 @@ def detect_discontinuities(
         disc_h_n = np.zeros_like(disc_h_d)
         disc_v_n = np.zeros_like(disc_v_d)
 
-    # 쌍 경계 결합
+    # 결합
     logic = normal_logic.lower()
     if logic == "or":
         disc_h = disc_h_d | disc_h_n
@@ -68,7 +64,7 @@ def detect_discontinuities(
     else:
         raise ValueError("normal_logic must be 'or'|'and'|'only'")
 
-    # 픽셀 1D 경계로 승격: 어느 방향으로든 경계에 접하면 True
+    # 픽셀 1D 경계로 승격
     disc = np.zeros((H, W), dtype=bool)
     disc[:, 1:]  |= disc_h
     disc[:, :-1] |= disc_h
@@ -85,7 +81,6 @@ def gates_from_disc_1d(disc: np.ndarray) -> dict:
       - pix_disc: 픽셀 경계
     """
     H, W = disc.shape
-    # 두 픽셀 중 하나라도 경계면 그 '쌍'은 경계로 간주
     pair_disc_h = disc[:, :-1] | disc[:, 1:]   # (H,W-1)
     pair_disc_v = disc[:-1, :] | disc[1:, :]   # (H-1,W)
 
@@ -93,7 +88,6 @@ def gates_from_disc_1d(disc: np.ndarray) -> dict:
     mask_v = ~pair_disc_v
     pix_disc = disc
 
-    # 이웃 후보: 경계 '넘지 않기' → 해당 쌍이 경계면 False
     candL_ok = np.zeros((H, W), dtype=bool); candL_ok[:, 1:]  = ~pair_disc_h
     candR_ok = np.zeros((H, W), dtype=bool); candR_ok[:, :-1] = ~pair_disc_h
     candU_ok = np.zeros((H, W), dtype=bool); candU_ok[1:, :]  = ~pair_disc_v
@@ -112,7 +106,7 @@ def refine_depth_normal_alignment(
     hole_mask: np.ndarray,
     n_guide: np.ndarray | None,
     K: np.ndarray | None,
-    discontinuity_maps: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+    discontinuity_maps: np.ndarray | None = None,  # (H,W) bool map
     lambda_normal: float = 3.0,
     lambda_smooth: float = 0.2,
     lambda_equal: float = 1.0,
@@ -124,36 +118,23 @@ def refine_depth_normal_alignment(
     solver: str = "lsmr"
 ) -> np.ndarray:
     """
-    Discontinuity(깊이 경계) 기반 게이팅:
+    경계 기반 게이팅:
       - (S) 스무딩: 경계 쌍 제외
-      - (D) 데이터: 모든 픽셀에 대해 4방향 중 비-경계 이웃 가운데 |Δz_ref| 최소 하나로 스칼라 앵커
-      - (N) 노멀: 경계 쌍 제외
-    guide_gray/edge_alpha는 사용하지 않음(시그니처만 유지).
-
-    Args:
-        depth_in: 입력 깊이 맵
-        known_mask: 알려진 영역 마스크
-        hole_mask: 홀 영역 마스크
-        n_guide: 가이드 노멀 벡터
-        K: 카메라 내부 파라미터
-        discontinuity_maps: discontinuity 감지 결과 (disc_h, disc_v, discL, discR, discU, discD)
-                           None이면 자동으로 감지
-        lambda_normal: 노멀 정합 가중치
-        lambda_smooth: 스무딩 가중치
-        lambda_data: 데이터 가중치
-        lambda_screen: 스크린 앵커 가중치
-        lambda_n: 노멀 유사도 가중치
-        tau_n: 노멀 유사도 임계값
-        tol: 수렴 기준
-        maxiter: 최대 반복수
-        solver: 솔버 선택
-        tau_discon_rel: 상대 discontinuity 임계값
-        tau_discon_abs: 절대 discontinuity 임계값
+      - (E) equal: 경계 p에서 known/hole 이웃을 모두 고려. w_base=exp(-|Δz|^2/2σ^2), known은 gain_known, hole은 gain_hole 배수.
+      - (P) plane: 동일 정책
+      - (R) screen, (K) keep-known
     """
     H, W = depth_in.shape
     depth_in = depth_in.astype(np.float32, copy=False)
 
-    # 변수 인덱스: 전 픽셀 변수
+    # === 튜닝 파라미터 ===
+    sigma_equal  = 0.02   # |Δz| 가우시안 폭 (equal)
+    sigma_plane  = 0.02   # |Δz| 가우시안 폭 (plane)
+    tau_n_plane  = None   # 예: 0.95면 법선 유사도 게이트, None이면 미사용
+    gain_known   = 2.0    # ==== (핵심: known>hole 가중) ====
+    gain_hole    = 1.0    # ==== (핵심: known>hole 가중) ====
+
+    # 변수 인덱스
     idx_map = np.arange(H * W, dtype=np.int32).reshape(H, W)
     N = H * W
 
@@ -161,8 +142,7 @@ def refine_depth_normal_alignment(
     if K is None:
         K = np.array([[W, 0, W/2], [0, W, H/2], [0, 0, 1]], dtype=np.float32)
     if n_guide is None:
-        n = np.zeros((H, W, 3), dtype=np.float32)
-        n[..., 2] = 1.0
+        n = np.zeros((H, W, 3), dtype=np.float32); n[..., 2] = 1.0
     else:
         n = n_guide.astype(np.float32, copy=False)
 
@@ -183,15 +163,13 @@ def refine_depth_normal_alignment(
     ry = rays[1:, :, :] - rays[:-1, :, :]
 
     # ---- Discontinuity detection ----
-    fused = gates_from_disc_1d(discontinuity_maps)
+    disc = detect_discontinuities(depth_in, n=n, use_normals=False) if (discontinuity_maps is None) else discontinuity_maps
+    fused = gates_from_disc_1d(disc)
     mask_h, mask_v = fused["mask_h"], fused["mask_v"]
     pix_disc = fused["pix_disc"]
 
     # ----- 빅 COO/벡터 버퍼 -----
-    data_buf = []
-    row_buf = []
-    col_buf = []
-    b_buf = []
+    data_buf = []; row_buf = []; col_buf = []; b_buf = []
     row_ofs = 0
 
     def _append_block(vals, ridx, cidx, rhs):
@@ -215,10 +193,6 @@ def refine_depth_normal_alignment(
         p_idx = idx_map[:, :-1].reshape(-1)
         q_idx = idx_map[:,  1:].reshape(-1)
 
-        base_w_h = lamN * np.ones(p_idx.size, np.float32)
-
-        ww_h = base_w_h
-
         ok_h = mask_h.reshape(-1)
 
         a = np.sum(n_p * r_p, axis=1).astype(np.float32)
@@ -231,7 +205,8 @@ def refine_depth_normal_alignment(
         if np.any(ok_h):
             Kk = int(np.count_nonzero(ok_h))
             rr = np.arange(Kk, dtype=np.int32)
-            vals = np.concatenate([ww_h[ok_h]*c_p[ok_h], ww_h[ok_h]*c_q[ok_h]])
+            ww = lamN * np.ones(Kk, np.float32)
+            vals = np.concatenate([ww * c_p[ok_h], ww * c_q[ok_h]])
             ridx = np.concatenate([rr, rr])
             cidx = np.concatenate([p_idx[ok_h], q_idx[ok_h]])
             rhs  = np.zeros(Kk, np.float32)
@@ -243,10 +218,6 @@ def refine_depth_normal_alignment(
         rdy = ry.reshape(-1, 3)
         p_idx = idx_map[:-1, :].reshape(-1)
         q_idx = idx_map[ 1:, :].reshape(-1)
-
-        base_w_v = lamN * np.ones(p_idx.size, np.float32)
-
-        ww_v = base_w_v
 
         ok_v = mask_v.reshape(-1)
 
@@ -260,13 +231,14 @@ def refine_depth_normal_alignment(
         if np.any(ok_v):
             Kk = int(np.count_nonzero(ok_v))
             rr = np.arange(Kk, dtype=np.int32)
-            vals = np.concatenate([ww_v[ok_v]*c_p[ok_v], ww_v[ok_v]*c_q[ok_v]])
+            ww = lamN * np.ones(Kk, np.float32)
+            vals = np.concatenate([ww * c_p[ok_v], ww * c_q[ok_v]])
             ridx = np.concatenate([rr, rr])
             cidx = np.concatenate([p_idx[ok_v], q_idx[ok_v]])
             rhs  = np.zeros(Kk, np.float32)
             _append_block(vals, ridx, cidx, rhs)
 
-    # ===== (S) 스무딩: 경계 쌍 제외 (균등 가중) =====
+    # ===== (S) 스무딩: 경계 쌍 제외 =====
     if lambda_smooth > 0:
         lamS = np.sqrt(lambda_smooth)
 
@@ -296,11 +268,7 @@ def refine_depth_normal_alignment(
             rhs  = np.zeros(Kk, np.float32)
             _append_block(vals, ridx, cidx, rhs)
 
-    ## ===== (D_weighted_multi) 경계 p → 모든 이웃 q 사용, 초기 |Δz|로 가우시안 가중 =====
-    sigma_equal  = 0.02      # 가우시안 폭(깊이 단위). 작을수록 가까운 것만 강하게.
-    sigma_plane  = 0.02
-    tau_n_plane  = None      # 예: 0.95 쓰면 법선 유사도 필터링. None이면 미사용.
-
+    # ===== (E,P) 경계 p에서 known/hole 모두 고려: known에 더 큰 가중 =====
     if (lambda_equal > 0) or (lambda_plane > 0):
         lamE = np.float32(np.sqrt(lambda_equal)) if lambda_equal > 0 else np.float32(0.0)
         lamP = np.float32(np.sqrt(lambda_plane)) if lambda_plane > 0 else np.float32(0.0)
@@ -308,67 +276,68 @@ def refine_depth_normal_alignment(
         sp2  = np.float32(2.0*(max(sigma_plane, 1e-8)**2))
         eps  = 1e-6
 
-        # (p: 중심, q: 이웃) 4-이웃 슬라이스
+        # 4-이웃 슬라이스 집합
         dirs = [
-            ((slice(None), slice(1,   W)), (slice(None), slice(0,   W-1))),  # left
-            ((slice(None), slice(0,   W-1)), (slice(None), slice(1,   W))),  # right
-            ((slice(1,   H), slice(None)), (slice(0,   H-1), slice(None))),  # up
-            ((slice(0,   H-1), slice(None)), (slice(1,   H),   slice(None))) # down
+            ((slice(None), slice(1,   W)), (slice(None), slice(0,   W-1))),  # left q
+            ((slice(None), slice(0,   W-1)), (slice(None), slice(1,   W))),  # right q
+            ((slice(1,   H), slice(None)), (slice(0,   H-1), slice(None))),  # up q
+            ((slice(0,   H-1), slice(None)), (slice(1,   H),   slice(None))) # down q
         ]
 
         for p_sl, q_sl in dirs:
-            # 경계 픽셀만 대상
             pmask = pix_disc[p_sl]
             if not np.any(pmask):
                 continue
 
-            # 인덱스/기하량/초기깊이
+            # 인덱스/기하량
             p_ids = idx_map[p_sl][pmask]
             q_ids = idx_map[q_sl][pmask]
-
-            zp = depth_in[p_sl][pmask]      # (K,)
-            zq = depth_in[q_sl][pmask]      # (K,)
-            finite_q = np.isfinite(zq)
+            zp = depth_in[p_sl][pmask]
+            zq = depth_in[q_sl][pmask]; finite_q = np.isfinite(zq)
 
             n_p = n[p_sl][pmask]
             n_q = n[q_sl][pmask]
             r_p = rays[p_sl][pmask]
             r_q = rays[q_sl][pmask]
 
-            # 초기 |Δz|
+            # |Δz| 기반 기본 가우시안 웨이트
             dz = np.abs(zp - zq).astype(np.float32)
+            wE_base = np.exp(-(dz*dz)/se2).astype(np.float32) if lambda_equal > 0 else None
+            wP_base = np.exp(-(dz*dz)/sp2).astype(np.float32) if lambda_plane > 0 else None
 
-            # (옵션) 법선 유사도 필터
+            # known / hole 분리
+            q_known = known_mask[q_sl][pmask] & finite_q
+            q_hole  = (~known_mask[q_sl][pmask])
+
+            # (옵션) 법선 유사도 게이트
             if tau_n_plane is not None:
                 cos_n = np.abs(np.sum(n_p * n_q, axis=-1)).astype(np.float32)
                 normal_ok = (cos_n >= float(tau_n_plane))
             else:
-                normal_ok = np.ones_like(dz, dtype=bool)
+                normal_ok = np.ones(zp.shape, dtype=bool)
 
-            # ---------- Equal: d_p ≈ d_q (가우시안 가중) ----------
+            # ---------- Equal: d_p ≈ z_q (known 앵커) / d_p ≈ d_q (hole 커플링) ----------
             if lambda_equal > 0:
-                # known이면 RHS 앵커, 그 외 커플링
-                q_known = known_mask[q_sl][pmask] & finite_q
+                # ==== (핵심: known>hole 가중) ====
+                wE_known = lamE * gain_known * wE_base
+                wE_hole  = lamE * gain_hole  * wE_base
 
-                # 가우시안 가중치 (가까울수록 큼)
-                wE = lamE * np.exp(-(dz*dz)/se2).astype(np.float32)
-
-                # A) q known → p 앵커: sqrt(λ) * wE * (d_p - z_q) = 0
-                okA = normal_ok & q_known & (wE > 0)
+                # A) known 앵커
+                okA = q_known & normal_ok & (wE_known > 0)
                 if np.any(okA):
                     var_p = p_ids[okA]
-                    ww    = wE[okA]
+                    ww    = wE_known[okA]
                     rr    = np.arange(var_p.size, dtype=np.int32)
                     rhs   = ww * zq[okA].astype(np.float32)
                     _append_block(ww, rr, var_p, rhs)
 
-                # B) q hole/경계 → p-q 커플링: sqrt(λ) * wE * (d_p - d_q) = 0
-                okB = normal_ok & (~q_known) & (wE > 0) & (q_ids >= 0)  # q 인덱스 유효
+                # B) hole 커플링
+                okB = q_hole & normal_ok & (wE_hole > 0) & (q_ids >= 0)
                 if np.any(okB):
                     var_p = p_ids[okB]
                     var_q = q_ids[okB].astype(np.int32)
-                    wwP   = wE[okB]
-                    wwQ   = -wE[okB]
+                    wwP   = wE_hole[okB]
+                    wwQ   = -wE_hole[okB]
                     Kk    = var_p.size
                     rr    = np.arange(Kk, dtype=np.int32)
                     vals  = np.concatenate([wwP, wwQ])
@@ -377,35 +346,36 @@ def refine_depth_normal_alignment(
                     rhs   = np.zeros(Kk, np.float32)
                     _append_block(vals, ridx, cidx, rhs)
 
-            # ---------- Plane: (n_q·r_p) d_p ≈ (n_q·r_q) d_q (가우시안 가중) ----------
+            # ---------- Plane: (n_q·r_p) d_p ≈ (n_q·r_q) z_q / d_q ----------
             if lambda_plane > 0:
                 alpha = np.sum(n_q * r_p, axis=-1).astype(np.float32)
                 gamma = np.sum(n_q * r_q, axis=-1).astype(np.float32)
                 stable = (np.abs(alpha) > eps) & (np.abs(gamma) > eps)
 
-                # 가우시안 가중치
-                wP = lamP * np.exp(-(dz*dz)/sp2).astype(np.float32)
+                # ==== (핵심: known>hole 가중) ====
+                wP_known = lamP * gain_known * wP_base
+                wP_hole  = lamP * gain_hole  * wP_base
 
-                # A) q known → p 앵커: sqrt(λ) * wP * (alpha d_p - gamma z_q) = 0
-                okPA = normal_ok & stable & known_mask[q_sl][pmask] & finite_q & (wP > 0)
+                # A) known 앵커: sqrt(λ) * w * (alpha d_p - gamma z_q) = 0
+                okPA = q_known & normal_ok & stable & (wP_known > 0)
                 if np.any(okPA):
                     var_p = p_ids[okPA]
-                    ww    = wP[okPA] * alpha[okPA]
                     rr    = np.arange(var_p.size, dtype=np.int32)
-                    rhs   = (wP[okPA] * gamma[okPA] * zq[okPA].astype(np.float32))
+                    ww    = wP_known[okPA] * alpha[okPA]
+                    rhs   = (wP_known[okPA] * gamma[okPA] * zq[okPA].astype(np.float32))
                     _append_block(ww, rr, var_p, rhs)
 
-                # B) q hole/경계 → p-q 커플링: sqrt(λ) * wP * (alpha d_p - gamma d_q) = 0
-                okPB = normal_ok & stable & (~known_mask[q_sl][pmask]) & (wP > 0) & (q_ids >= 0)
+                # B) hole 커플링: sqrt(λ) * w * (alpha d_p - gamma d_q) = 0
+                okPB = q_hole & normal_ok & stable & (wP_hole > 0) & (q_ids >= 0)
                 if np.any(okPB):
                     var_p = p_ids[okPB]
                     var_q = q_ids[okPB].astype(np.int32)
-                    wwPp  = wP[okPB] * alpha[okPB]
-                    wwPq  = -wP[okPB] * gamma[okPB]
+                    wwPp  = wP_hole[okPB] * alpha[okPB]
+                    wwPq  = -wP_hole[okPB] * gamma[okPB]
                     Kk    = var_p.size
                     rr    = np.arange(Kk, dtype=np.int32)
                     vals  = np.concatenate([wwPp, wwPq])
-                    ridx  = np.concatenate([rr,   rr  ])
+                    ridx  = np.concatenate([rr, rr])
                     cidx  = np.concatenate([var_p, var_q])
                     rhs   = np.zeros(Kk, np.float32)
                     _append_block(vals, ridx, cidx, rhs)
@@ -420,7 +390,7 @@ def refine_depth_normal_alignment(
             ww = lamR * np.ones(Kk, np.float32)
             _append_block(ww, rr, ids, ww * depth_in[hole_mask].astype(np.float32))
 
-    # ===== (K) Keep-known =====
+    # (K) Keep-known
     if lambda_keep > 0:
         lamK = np.float32(np.sqrt(lambda_keep))
         ids = idx_map[known_mask]
@@ -428,7 +398,7 @@ def refine_depth_normal_alignment(
             Kk = ids.size
             rr = np.arange(Kk, dtype=np.int32)
             ww = lamK * np.ones(Kk, np.float32)
-        _append_block(ww, rr, ids, ww * depth_in[known_mask].astype(np.float32))
+            _append_block(ww, rr, ids, ww * depth_in[known_mask].astype(np.float32))
 
     # ===== 시스템 조립/해 =====
     if len(data_buf) == 0:
