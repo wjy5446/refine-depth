@@ -429,7 +429,8 @@ if 'data_loaded' in st.session_state and st.session_state.data_loaded:
                     st.session_state.depth_gt,
                     st.session_state.depth_in,
                     st.session_state.depth_initialize,
-                    st.session_state.depth_refined
+                    st.session_state.depth_refined,
+                    st.session_state.discontinue_maps
                 )
 
         with tab2:

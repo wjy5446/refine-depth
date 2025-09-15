@@ -335,10 +335,8 @@ def render_matplotlib_visualization(depth_gt, depth_in, depth_initialize, depth_
     plt.close(fig)
 
 
-def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_refined):
+def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_refined, discontinue_maps):
     """Plotly를 사용한 3D 인터랙티브 시각화를 렌더링합니다."""
-    from refine import detect_discontinuities
-
     H, W = depth_gt.shape
 
     # 서브플롯 생성 (1행 4열)
@@ -350,7 +348,7 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
     )
 
     # depth_initialize에서 불연속 맵 계산 (한 번만)
-    disc_map_initialize = detect_discontinuities(depth_initialize, tau_rel=0.05)
+    disc_map_initialize = discontinue_maps
 
     # 각 단계별 데이터 준비
     surfaces = [
@@ -412,7 +410,6 @@ def render_plotly_3d_visualization(depth_gt, depth_in, depth_initialize, depth_r
                         x_coord = int(x_flat[idx])
                         y_coord = int(y_flat[idx])
                         z_val = z_flat[idx]
-                        is_discontinuous = disc_flat[idx]
 
                         hover_text = (
                             f"<b>{name}</b><br>"

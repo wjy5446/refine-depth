@@ -1,7 +1,7 @@
 import numpy as np
 import time
 from initialization import initial_guess_logpoisson_completion
-from refine_fast import refine_depth_normal_alignment
+from refine_2stage import refine_depth_normal_alignment, refine_mask_equal_plane_from_depth
 from refine import detect_discontinuities
 
 
@@ -74,9 +74,8 @@ def depth_completion(
 
     total_start_time = time.time()
     depth_in = depth_in.astype(np.float32)
-    refine_roi = refine_roi.astype(bool)
     known_mask = (valid_mask.astype(bool) & np.isfinite(depth_in.astype(np.float64)))
-    hole_mask = refine_roi & (~known_mask)
+    hole_mask = ~known_mask
 
     print(lambda_init_grad, lambda_init_smooth, lambda_init_normal_edge)
     print(lambda_refine_normal, lambda_refine_smooth, lambda_refine_equal, lambda_refine_plane, lambda_refine_screen)
@@ -112,7 +111,7 @@ def depth_completion(
 
     # 정련 단계
     refine_start_time = time.time()
-    depth_refined = refine_depth_normal_alignment(
+    depth_refined, refine_next = refine_depth_normal_alignment(
         depth_in=depth_initialize,
         known_mask=known_mask,
         hole_mask=hole_mask,
@@ -120,16 +119,20 @@ def depth_completion(
         K=K,
         discontinuity_maps=discontinue_maps,
         lambda_normal=lambda_refine_normal,
-        lambda_smooth=lambda_refine_smooth,
-        lambda_equal=lambda_refine_equal,
-        lambda_plane=lambda_refine_plane,
         lambda_screen=lambda_refine_screen,
         lambda_keep=lambda_refine_keep if lambda_refine_keep is not None else 30.0,
+    )
+
+    depth_refined = refine_mask_equal_plane_from_depth(
+        depth_in=depth_refined,
+        target_mask=refine_next,
+        K=K,
+        lambda_equal=lambda_refine_equal,
+        lambda_plane=lambda_refine_plane,
     )
     refine_end_time = time.time()
     timing_info['refine_time'] = refine_end_time - refine_start_time
 
     total_end_time = time.time()
     timing_info['total_time'] = total_end_time - total_start_time
-
-    return depth_initialize, depth_refined, discontinue_maps, timing_info
+    return depth_initialize, depth_refined, refine_next, timing_info
